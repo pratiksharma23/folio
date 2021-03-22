@@ -14,10 +14,9 @@
  * limitations under the License.
  */
 
- import { folio } from './fixtures';
- const { it, expect } = folio;
- 
- it('should support spec.ok', async ({ runInlineTest }) => {
-   // TODO: Add tests
- });
- 
+import { folio } from './fixtures';
+const { it, expect } = folio;
+
+it('should support spec.ok', async ({ runInlineTest }) => {
+  // TODO: Add tests
+});

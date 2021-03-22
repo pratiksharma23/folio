@@ -21,7 +21,7 @@ import { request } from 'https';
 import { EmptyReporter } from '../reporter';
 import { Config, Test, Suite, TestResult } from '../types';
 import { monotonicTime } from '../util';
-import storage, { BlobServiceClient, ContainerClient } from '@azure/storage-blob';
+import { BlobServiceClient, ContainerClient } from '@azure/storage-blob';
 import { formatFailure, stripAscii } from './base';
 
 export type RunResult = {
@@ -87,10 +87,10 @@ class ServiceReporter extends EmptyReporter {
   onBegin(config: Config, suite: Suite) {
     this.config = config;
     this.suite = suite;
-    this.writeSasToken = getSasToken("Write");
-    this.readSasToken = getSasToken("Read");
+    this.writeSasToken = getSasToken('Write');
+    this.readSasToken = getSasToken('Read');
     this.startTime = monotonicTime();
-    this.blobService = new storage.BlobServiceClient(`${this.writeSasToken}`);
+    this.blobService = new BlobServiceClient(`${this.writeSasToken}`);
     this.containerClient = this.blobService.getContainerClient(process.env.GITHUB_RUN_ID);
   }
 
@@ -127,9 +127,8 @@ class ServiceReporter extends EmptyReporter {
 
   private _registerTestResults() {
     const testSuites: TestSuiteResult[] = [];
-    for (const suite of this.suite.suites) {
+    for (const suite of this.suite.suites)
       testSuites.push(this._getTestSuiteResults(suite));
-    }
 
     const testResultsFile = `${this.config.outputDir}/testResults.json`;
     const testResultsZippedFile = `${this.config.outputDir}/testResults.zip`;
@@ -160,11 +159,10 @@ class ServiceReporter extends EmptyReporter {
     this.failedTests += failures;
 
     ++this.totalTestSuites;
-    if (tests === skipped) {
+    if (tests === skipped)
       ++this.skippedTestSuites;
-    } else if (failures !== 0) {
+    else if (failures !== 0)
       ++this.failedTestSuites;
-    }
 
     const testSuiteResult: TestSuiteResult = {
       path: suite.file,
@@ -189,7 +187,7 @@ class ServiceReporter extends EmptyReporter {
       status = 'failed';
       failureMessages.push(stripAscii(formatFailure(this.config, test)));
     }
-    let testCase: TestCaseResult = {
+    const testCase: TestCaseResult = {
       name: test.spec.fullTitle(),
       status: status,
       duration: (test.results.reduce((acc, value) => acc + value.duration, 0)) / 1000,
@@ -223,7 +221,7 @@ class ServiceReporter extends EmptyReporter {
       endTime: this.endTime,
       status: this.failedTests === 0 ? true : false,
       testResults: this._getTestResultBlobs()
-    }
+    };
     postRunResult(runResult);
   }
 
@@ -234,7 +232,7 @@ class ServiceReporter extends EmptyReporter {
   }
 
   private _getSasUriForBlob(filePath: string): string {
-    let splitted: string[] = this.readSasToken.split('?sv');
+    const splitted: string[] = this.readSasToken.split('?sv');
     return `${splitted[0]}/${filePath}?sv${splitted[1]}`;
   }
 
@@ -258,20 +256,20 @@ function getSasToken(permission: string): null | string {
   let sasToken: string;
   const options = {
     hostname: process.env.ENDPOINT,
-    path: `api/${process.env.TENANT_ID}/sasuri?runId=${process.env.GITHUB_RUN_ID}?op=${permission}`,
+    path: `api/${process.env.TENANT_ID}/artifacts/sasuri/${process.env.GITHUB_RUN_ID}?op=${permission}`,
     method: 'GET'
-  }
+  };
 
   const req = request(options, res => {
     res.on('data', d => {
       sasToken = JSON.parse(d).sasUri;
-    })
-  })
+    });
+  });
 
   req.on('error', error => {
-    console.error(error)
-  })
-  req.end()
+    console.error(error);
+  });
+  req.end();
   return sasToken;
 }
 
@@ -284,31 +282,32 @@ function postRunResult(runResult: RunResult) {
       'Content-Type': 'application/json',
       'Accept': '*/*',
     }
-  }
+  };
 
   const req = request(options, res => {
     res.on('data', d => {
-      process.stdout.write(d)
-    })
-  })
+      process.stdout.write(d);
+    });
+  });
 
   req.on('error', error => {
-    console.error(error)
-  })
+    console.error(error);
+  });
   req.write(JSON.stringify(runResult));
-  req.end()
+  req.end();
 }
 
 function getAllFilesFromFolder(dir: string): string[] {
   let results: string[] = [];
 
-  fs.readdirSync(dir).forEach(function (file) {
+  fs.readdirSync(dir).forEach(function(file) {
     file = dir + '/' + file;
-    var stat = fs.statSync(file);
+    const stat = fs.statSync(file);
 
-    if (stat && stat.isDirectory()) {
-      results = results.concat(getAllFilesFromFolder(file))
-    } else results.push(file);
+    if (stat && stat.isDirectory())
+      results = results.concat(getAllFilesFromFolder(file));
+    else
+      results.push(file);
 
   });
   return results;

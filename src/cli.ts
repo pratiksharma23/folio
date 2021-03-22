@@ -25,6 +25,7 @@ import JSONReporter from './reporters/json';
 import JUnitReporter from './reporters/junit';
 import LineReporter from './reporters/line';
 import ListReporter from './reporters/list';
+import ServiceReporter from './reporters/service';
 import { Multiplexer } from './reporters/multiplexer';
 import { Runner } from './runner';
 import { assignConfig, config } from './fixtures';
@@ -36,6 +37,7 @@ export const reporters = {
   'junit': JUnitReporter,
   'line': LineReporter,
   'list': ListReporter,
+  'service': ServiceReporter,
   'null': EmptyReporter,
 };
 
