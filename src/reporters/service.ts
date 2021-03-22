@@ -46,6 +46,7 @@ export type RunResult = {
   startTime: number;
   endTime: number;
   status: boolean;
+  testResults: string[];
 }
 
 export interface TestSuiteResult {
@@ -69,7 +70,8 @@ export interface TestCaseResult {
 class ServiceReporter extends EmptyReporter {
   config: Config;
   suite: Suite;
-  private sasToken: string;
+  private readSasToken: string;
+  private writeSasToken: string;
   private blobService: BlobServiceClient;
   private containerClient: ContainerClient;
   private startTime: number;
@@ -85,9 +87,10 @@ class ServiceReporter extends EmptyReporter {
   onBegin(config: Config, suite: Suite) {
     this.config = config;
     this.suite = suite;
-    this.sasToken = getSasToken();
+    this.writeSasToken = getSasToken("Write");
+    this.readSasToken = getSasToken("Read");
     this.startTime = monotonicTime();
-    this.blobService = new storage.BlobServiceClient(`${this.sasToken}`);
+    this.blobService = new storage.BlobServiceClient(`${this.writeSasToken}`);
     this.containerClient = this.blobService.getContainerClient(process.env.GITHUB_RUN_ID);
   }
 
@@ -104,7 +107,7 @@ class ServiceReporter extends EmptyReporter {
       for (const file of files) {
         const relativePath = this._getRelativePath(file);
         this._createBlobInContainer(file, relativePath);
-        testArtifacts.push(`${process.env.GITHUB_RUN_ID}/${relativePath}`);
+        testArtifacts.push(this._getSasUriForBlob(`${process.env.GITHUB_RUN_ID}/${relativePath}`));
       }
       this.artifactMap.set(this._getTestKey(test), testArtifacts);
     }
@@ -218,9 +221,21 @@ class ServiceReporter extends EmptyReporter {
       numPassedTests: this.totalTests - (this.failedTests + this.skippedTests),
       startTime: this.startTime,
       endTime: this.endTime,
-      status: this.failedTests === 0 ? true : false
+      status: this.failedTests === 0 ? true : false,
+      testResults: this._getTestResultBlobs()
     }
     postRunResult(runResult);
+  }
+
+  private _getTestResultBlobs(): string[] {
+    let testResultBlobs: string[];
+    testResultBlobs.push(this._getSasUriForBlob(`${process.env.GITHUB_RUN_ID}/testResults.zip`));
+    return testResultBlobs;
+  }
+
+  private _getSasUriForBlob(filePath: string): string {
+    let splitted: string[] = this.readSasToken.split('?sv');
+    return `${splitted[0]}/${filePath}?sv${splitted[1]}`;
   }
 
   private async _createBlobInContainer(file: string, blobName: string) {
@@ -239,11 +254,11 @@ class ServiceReporter extends EmptyReporter {
   }
 }
 
-function getSasToken(): null | string {
+function getSasToken(permission: string): null | string {
   let sasToken: string;
   const options = {
     hostname: process.env.ENDPOINT,
-    path: `api/${process.env.TENANT_ID}/sasuri?runId=${process.env.GITHUB_RUN_ID}`,
+    path: `api/${process.env.TENANT_ID}/sasuri?runId=${process.env.GITHUB_RUN_ID}?op=${permission}`,
     method: 'GET'
   }
 
