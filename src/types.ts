@@ -18,31 +18,25 @@ import type { Expect } from './expectType';
 
 export interface Config {
   forbidOnly?: boolean;
-  globalTimeout: number;
-  grep?: string;
-  maxFailures: number;
-  outputDir: string;
+  globalTimeout?: number;
+  grep?: RegExp | RegExp[];
+  maxFailures?: number;
+  outputDir?: string;
+  repeatEach?: number;
+  retries?: number;
   quiet?: boolean;
-  repeatEach: number;
-  retries: number;
-  shard?: { total: number, current: number };
-  snapshotDir: string;
-  testDir: string;
-  timeout: number;
-  updateSnapshots: boolean;
-  workers: number;
+  shard?: { total: number, current: number } | null;
+  snapshotDir?: string;
+  testDir?: string;
+  testIgnore?: string | RegExp | (string | RegExp)[];
+  testMatch?: string | RegExp | (string | RegExp)[];
+  timeout?: number;
+  updateSnapshots?: boolean;
+  workers?: number;
 }
+export type FullConfig = Required<Config>;
 
-export type TestStatus = 'passed' | 'failed' | 'timedOut' | 'skipped';
-
-export interface TestModifier {
-  setTimeout(timeout: number): void;
-
-  slow(): void;
-  slow(condition: boolean): void;
-  slow(description: string): void;
-  slow(condition: boolean, description: string): void;
-
+interface TestModifier {
   skip(): void;
   skip(condition: boolean): void;
   skip(description: string): void;
@@ -57,13 +51,23 @@ export interface TestModifier {
   fail(condition: boolean): void;
   fail(description: string): void;
   fail(condition: boolean, description: string): void;
+
+  slow(): void;
+  slow(condition: boolean): void;
+  slow(description: string): void;
+  slow(condition: boolean, description: string): void;
+
+  setTimeout(timeout: number): void;
 }
 
-export interface TestModifierFunction {
-  (modifier: TestModifier, variation: folio.SuiteVariation): any;
+export type TestStatus = 'passed' | 'failed' | 'timedOut' | 'skipped';
+
+export interface WorkerInfo {
+  config: FullConfig;
+  workerIndex: number;
 }
 
-export interface TestInfo {
+export interface TestInfo extends WorkerInfo, TestModifier {
   // Declaration
   title: string;
   file: string;
@@ -71,16 +75,12 @@ export interface TestInfo {
   column: number;
   fn: Function;
 
-  // Parameters
-  options: folio.SuiteOptions;
-  variation: folio.SuiteVariation;
-  workerIndex: number;
-  repeatEachIndex: number;
-  retry: number;
-
   // Modifiers
   expectedStatus: TestStatus;
   timeout: number;
+  annotations: { type: string, description?: string }[];
+  repeatEachIndex: number;
+  retry: number;
 
   // Results
   duration: number;
@@ -88,59 +88,78 @@ export interface TestInfo {
   error?: any;
   stdout: (string | Buffer)[];
   stderr: (string | Buffer)[];
-  data: any;
+  data: { [key: string]: any };
 
   // Paths
-  relativeArtifactsPath: string;
+  snapshotPathSegment: string;
+  outputDir: string;
   snapshotPath: (...pathSegments: string[]) => string;
   outputPath: (...pathSegments: string[]) => string;
 }
 
 interface SuiteFunction {
   (name: string, inner: () => void): void;
-  (name: string, modifierFn: (modifier: TestModifier, variation: folio.SuiteVariation) => any, inner: () => void): void;
-}
-interface SuiteFunctionWithModifiers extends SuiteFunction {
-  only: SuiteFunction;
-  skip: SuiteFunction;
-}
-interface SuiteHookFunction {
-  (inner: (fixtures: folio.WorkerFixtures) => Promise<void> | void): void;
 }
 
-interface TestFunction {
-  (name: string, inner: (fixtures: folio.WorkerFixtures & folio.TestFixtures) => Promise<void> | void): void;
-  (name: string, modifierFn: (modifier: TestModifier, variation: folio.SuiteVariation) => any, inner: (fixtures: folio.WorkerFixtures & folio.TestFixtures) => Promise<void> | void): void;
-}
-interface TestHookFunction {
-  (inner: (fixtures: folio.WorkerFixtures & folio.TestFixtures) => Promise<void> | void): void;
+interface TestFunction<TestArgs> {
+  (name: string, inner: (args: TestArgs, testInfo: TestInfo) => Promise<void> | void): void;
 }
 
-export interface TestSuiteFunction extends TestFunction {
-  only: TestFunction;
-  skip: TestFunction;
-  beforeEach: TestHookFunction;
-  afterEach: TestHookFunction;
-  describe: SuiteFunctionWithModifiers;
-  beforeAll: SuiteHookFunction;
-  afterAll: SuiteHookFunction;
+export interface TestType<TestArgs, WorkerArgs, TestOptions, WorkerOptions> extends TestFunction<TestArgs>, TestModifier {
+  only: TestFunction<TestArgs>;
+  describe: SuiteFunction & {
+    only: SuiteFunction;
+  };
+
+  beforeEach(inner: (args: TestArgs, testInfo: TestInfo) => Promise<any> | any): void;
+  afterEach(inner: (args: TestArgs, testInfo: TestInfo) => Promise<any> | any): void;
+  beforeAll(inner: (args: WorkerArgs, workerInfo: WorkerInfo) => Promise<any> | any): void;
+  afterAll(inner: (args: WorkerArgs, workerInfo: WorkerInfo) => Promise<any> | any): void;
+  useOptions(options: TestOptions): void;
+
   expect: Expect;
+
+  extend(): TestType<TestArgs, WorkerArgs, TestOptions, WorkerOptions>;
+  extend<T, W, TO, WO>(env: Env<T, W, TO, WO, TestArgs & TestOptions, WorkerArgs & WorkerOptions>): TestType<TestArgs & T, WorkerArgs & W, TestOptions & TO, WorkerOptions & WO>;
+  // TODO: use Declared{Test,Worker}Args so that runWith also implements T and W.
+  declare<T = {}, W = {}>(): TestType<TestArgs & T, WorkerArgs & W, TestOptions, WorkerOptions>;
+
+  runWith(envAndConfig: EnvAndConfig<TestOptions, WorkerOptions>): void;
+  runWith(env: Env<TestOptions, WorkerOptions>, config: RunWithConfig<WorkerOptions>): void;
 }
 
-export interface WorkerFixture<R = any> {
-  (fixtures: folio.WorkerFixtures, run: (value: R) => Promise<void>): Promise<any>;
-}
-export interface TestFixture<R = any> {
-  (fixtures: folio.WorkerFixtures & folio.TestFixtures, run: (value: R) => Promise<void>): Promise<any>;
-}
-export interface ToBeRenamedInterface {
-  testFixtures?: { [key: string]: TestFixture };
-  autoTestFixtures?: { [key: string]: TestFixture };
-  workerFixtures?: { [key: string]: WorkerFixture };
-  autoWorkerFixtures?: { [key: string]: WorkerFixture };
-  configureSuite?: (suite: RootSuite) => any;
+export type RunWithConfig<WorkerArgs> = {
+  options?: WorkerArgs;
+  outputDir?: string;
+  repeatEach?: number;
+  retries?: number;
+  tag?: string | string[];
+  timeout?: number;
+};
+
+type EnvAndConfig<TestArgs, WorkerArgs> =
+  {} extends TestArgs
+  ? ({} extends WorkerArgs
+    ? Env<TestArgs, WorkerArgs> & RunWithConfig<WorkerArgs> | void
+    : Env<TestArgs, WorkerArgs> & RunWithConfig<WorkerArgs>)
+  : Env<TestArgs, WorkerArgs> & RunWithConfig<WorkerArgs>;
+type MaybePromise<T> = T | Promise<T>;
+type MaybeVoid<T> = {} extends T ? (T | void) : T;
+type RemovePromise<T> = T extends Promise<infer R> ? R : T;
+
+export interface Env<TestArgs = {}, WorkerArgs = {}, TestOptions = {}, WorkerOptions = {}, PreviousTestArgs = {}, PreviousWorkerArgs = {}> {
+  // For type inference.
+  testOptionsType?(): TestOptions;
+  optionsType?(): WorkerOptions;
+
+  // Implementation.
+  beforeEach?(args: PreviousTestArgs & TestOptions, testInfo: TestInfo): MaybePromise<MaybeVoid<TestArgs>>;
+  beforeAll?(args: PreviousWorkerArgs & WorkerOptions, workerInfo: WorkerInfo): MaybePromise<MaybeVoid<WorkerArgs>>;
+  afterEach?(args: this['beforeEach'] extends undefined ? TestArgs : RemovePromise<ReturnType<Exclude<this['beforeEach'], undefined>>>, testInfo: TestInfo): MaybePromise<any>;
+  afterAll?(args: this['beforeAll'] extends undefined ? WorkerArgs : RemovePromise<ReturnType<Exclude<this['beforeAll'], undefined>>>, workerInfo: WorkerInfo): MaybePromise<any>;
 }
 
+// ---------- Reporters API -----------
 
 export interface Suite {
   title: string;
@@ -164,13 +183,13 @@ export interface Spec {
 }
 export interface Test {
   spec: Spec;
-  variation: folio.SuiteVariation;
   results: TestResult[];
   skipped: boolean;
-  slow: boolean;
   expectedStatus: TestStatus;
   timeout: number;
-  annotations: any[];
+  annotations: { type: string, description?: string }[];
+  tags: string[];
+  retries: number;
   status(): 'skipped' | 'expected' | 'unexpected' | 'flaky';
   ok(): boolean;
 }
@@ -182,41 +201,20 @@ export interface TestResult {
   error?: TestError;
   stdout: (string | Buffer)[];
   stderr: (string | Buffer)[];
-  data: any;
+  data: { [key: string]: any };
 }
 export interface TestError {
   message?: string;
   stack?: string;
   value?: string;
 }
-export interface RootSuite extends Suite {
-  options: folio.SuiteOptions;
-  variations: folio.SuiteVariation[];
-  vary<K extends keyof folio.SuiteVariation>(key: K, values: folio.SuiteVariation[K][]): void;
-}
-
-declare global {
-  namespace folio {
-    // Fixtures initialized once per worker, available to any hooks and tests.
-    interface WorkerFixtures {
-      // Worker index that runs this test, built-in Folio fixture.
-      testWorkerIndex: number;
-    }
-
-    // Fixtures initialized once per test, available to any test.
-    interface TestFixtures {
-      // Information about the test being run, built-in Folio fixture.
-      testInfo: TestInfo;
-    }
-
-    // Options that can be passed to createTest().
-    interface SuiteOptions {
-      // Relative path, empty by default, built-in Folio option.
-      testPathSegment?: string;
-    }
-
-    // A bag of key/value properties. Tests may be run multiple times, with some combinations of these properties.
-    interface SuiteVariation {
-    }
-  }
+export interface Reporter {
+  onBegin(config: FullConfig, suite: Suite): void;
+  onTestBegin(test: Test): void;
+  onStdOut(chunk: string | Buffer, test?: Test): void;
+  onStdErr(chunk: string | Buffer, test?: Test): void;
+  onTestEnd(test: Test, result: TestResult): void;
+  onTimeout(timeout: number): void;
+  onError(error: TestError): void;
+  onEnd(): void;
 }

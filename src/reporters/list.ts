@@ -16,51 +16,57 @@
 
 import colors from 'colors/safe';
 import milliseconds from 'ms';
-import { BaseReporter } from './base';
-import { Config, Suite, Test, TestResult } from '../types';
+import { BaseReporter, formatTestTitle } from './base';
+import { FullConfig, Suite, Test, TestResult } from '../types';
 
 class ListReporter extends BaseReporter {
   private _failure = 0;
   private _lastRow = 0;
   private _testRows = new Map<Test, number>();
 
-  onBegin(config: Config, suite: Suite) {
+  onBegin(config: FullConfig, suite: Suite) {
     super.onBegin(config, suite);
     console.log();
   }
 
   onTestBegin(test: Test) {
     super.onTestBegin(test);
-    process.stdout.write('    ' + colors.gray(test.spec.fullTitle() + ': ') + '\n');
+    if (process.stdout.isTTY)
+      process.stdout.write('    ' + colors.gray(formatTestTitle(this.config, test) + ': ') + '\n');
     this._testRows.set(test, this._lastRow++);
   }
 
   onTestEnd(test: Test, result: TestResult) {
     super.onTestEnd(test, result);
-    const spec = test.spec;
 
     const duration = colors.dim(` (${milliseconds(result.duration)})`);
+    const title = formatTestTitle(this.config, test);
     let text = '';
     if (result.status === 'skipped') {
-      text = colors.green('  - ') + colors.cyan(spec.fullTitle());
+      text = colors.green('  - ') + colors.cyan(title);
     } else {
       const statusMark = result.status === 'passed' ? '  ✓ ' : '  x ';
       if (result.status === test.expectedStatus)
-        text = '\u001b[2K\u001b[0G' + colors.green(statusMark) + colors.gray(spec.fullTitle()) + duration;
+        text = '\u001b[2K\u001b[0G' + colors.green(statusMark) + colors.gray(title) + duration;
       else
-        text = '\u001b[2K\u001b[0G' + colors.red(`  ${++this._failure}) ` + spec.fullTitle()) + duration;
+        text = '\u001b[2K\u001b[0G' + colors.red(`${statusMark}${++this._failure}) ` + title) + duration;
     }
 
     const testRow = this._testRows.get(test);
     // Go up if needed
-    if (testRow !== this._lastRow)
+    if (process.stdout.isTTY && testRow !== this._lastRow)
       process.stdout.write(`\u001B[${this._lastRow - testRow}A`);
     // Erase line
-    process.stdout.write('\u001B[2K');
+    if (process.stdout.isTTY)
+      process.stdout.write('\u001B[2K');
     process.stdout.write(text);
     // Go down if needed.
-    if (testRow !== this._lastRow)
-      process.stdout.write(`\u001B[${this._lastRow - testRow}E`);
+    if (testRow !== this._lastRow) {
+      if (process.stdout.isTTY)
+        process.stdout.write(`\u001B[${this._lastRow - testRow}E`);
+      else
+        process.stdout.write('\n');
+    }
   }
 
   onEnd() {

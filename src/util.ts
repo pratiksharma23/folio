@@ -18,43 +18,60 @@ import path from 'path';
 import util from 'util';
 import StackUtils from 'stack-utils';
 import { TestError } from './types';
+import { default as minimatch } from 'minimatch';
 
 const FOLIO_DIRS = [__dirname, path.join(__dirname, '..', 'src')];
 const cwd = process.cwd();
 const stackUtils = new StackUtils({ cwd });
 
-export async function raceAgainstDeadline<T>(promise: Promise<T>, deadline: number): Promise<{ result?: T, timedOut?: boolean }> {
-  if (!deadline)
-    return { result: await promise };
+export class DeadlineRunner<T> {
+  private _timer: NodeJS.Timer | undefined;
+  private _done = false;
+  private _fulfill: (t: { result?: T, timedOut?: boolean }) => void;
+  private _reject: (error: any) => void;
 
-  const timeout = deadline - monotonicTime();
-  if (timeout <= 0)
-    return { timedOut: true };
+  readonly result: Promise<{ result?: T, timedOut?: boolean }>;
 
-  let timer: NodeJS.Timer;
-  let done = false;
-  let fulfill: (t: { result?: T, timedOut?: boolean }) => void;
-  let reject: (e: Error) => void;
-  const result = new Promise((f, r) => {
-    fulfill = f;
-    reject = r;
-  });
-  setTimeout(() => {
-    done = true;
-    fulfill({ timedOut: true });
-  }, timeout);
-  promise.then(result => {
-    clearTimeout(timer);
-    if (!done) {
-      done = true;
-      fulfill({ result });
+  constructor(promise: Promise<T>, deadline: number | undefined) {
+    this.result = new Promise((f, r) => {
+      this._fulfill = f;
+      this._reject = r;
+    });
+    promise.then(result => {
+      this._finish({ result });
+    }).catch(e => {
+      this._finish(undefined, e);
+    });
+    this.setDeadline(deadline);
+  }
+
+  private _finish(success?: { result?: T, timedOut?: boolean }, error?: any) {
+    if (this._done)
+      return;
+    this.setDeadline(undefined);
+    if (success)
+      this._fulfill(success);
+    else
+      this._reject(error);
+  }
+
+  setDeadline(deadline: number | undefined) {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = undefined;
     }
-  }).catch(e => {
-    clearTimeout(timer);
-    if (!done)
-      reject(e);
-  });
-  return result;
+    if (deadline === undefined)
+      return;
+    const timeout = deadline - monotonicTime();
+    if (timeout <= 0)
+      this._finish({ timedOut: true });
+    else
+      this._timer = setTimeout(() => this._finish({ timedOut: true }), timeout);
+  }
+}
+
+export async function raceAgainstDeadline<T>(promise: Promise<T>, deadline: number | undefined): Promise<{ result?: T, timedOut?: boolean }> {
+  return (new DeadlineRunner(promise, deadline)).result;
 }
 
 export function serializeError(error: Error | any): TestError {
@@ -111,4 +128,40 @@ export function prependErrorMessage(e: Error, message: string) {
     m = m.substring('Error:'.length);
   e.message = message + m;
   e.stack = e.message + stack;
+}
+
+export function interpretCondition(arg?: boolean | string, description?: string): { condition: boolean, description?: string } {
+  if (arg === undefined && description === undefined)
+    return { condition: true };
+  if (typeof arg === 'string')
+    return { condition: true, description: arg };
+  return { condition: !!arg, description };
+}
+
+export function createMatcher(patterns: string | RegExp | (string | RegExp)[]): (value: string) => boolean {
+  const list = Array.isArray(patterns) ? patterns : [patterns];
+  return (value: string) => {
+    for (const pattern of list) {
+      if (pattern instanceof RegExp || Object.prototype.toString.call(pattern) === '[object RegExp]') {
+        (pattern as RegExp).lastIndex = 0;
+        if ((pattern as RegExp).test(value))
+          return true;
+      } else {
+        if (minimatch(value, pattern))
+          return true;
+      }
+    }
+    return false;
+  };
+}
+
+export function mergeObjects<A extends object, B extends object>(a: A | undefined | void, b: B | undefined | void): A & B {
+  const result = { ...a };
+  if (!Object.is(b, undefined)) {
+    for (const [name, value] of Object.entries(b as B)) {
+      if (!Object.is(value, undefined))
+        result[name] = value;
+    }
+  }
+  return result as any;
 }

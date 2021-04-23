@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-import { folio } from './fixtures';
-const { it, expect } = folio;
+import * as fs from 'fs';
+import * as path from 'path';
+import { test, expect } from './config';
 
-it('should include repeat token', async ({runInlineTest}) => {
+test('should include repeat token', async ({runInlineTest}) => {
   const result = await runInlineTest({
     'a.spec.js': `
-      test('test', ({testInfo}) => {
+      test('test', ({}, testInfo) => {
         if (testInfo.repeatEachIndex)
           expect(testInfo.outputPath('')).toContain('repeat' + testInfo.repeatEachIndex);
         else
@@ -32,10 +33,10 @@ it('should include repeat token', async ({runInlineTest}) => {
   expect(result.passed).toBe(3);
 });
 
-it('should include retry token', async ({runInlineTest}) => {
+test('should include retry token', async ({runInlineTest}) => {
   const result = await runInlineTest({
     'a.spec.js': `
-      test('test', ({testInfo}) => {
+      test('test', ({}, testInfo) => {
         expect(testInfo.outputPath('')).toContain('retry' + testInfo.retry);
         expect(testInfo.retry).toBe(2);
       });
@@ -45,26 +46,51 @@ it('should include retry token', async ({runInlineTest}) => {
   expect(result.flaky).toBe(1);
 });
 
-it('should respect testPathSegment from config and options', async ({runInlineTest}) => {
+test('should include tag', async ({runInlineTest}) => {
   const result = await runInlineTest({
-    'fixtures.ts': `
-      export const toBeRenamed = {
-        configureSuite: suite => {
-          if (!suite.options.testPathSegment)
-            suite.options.testPathSegment = 'hello';
-        },
-      };
+    'folio.config.ts': `
+      export const test = folio.test;
+      test.runWith({ tag: 'my-title' });
     `,
     'a.spec.js': `
-      test('test', ({testInfo}) => {
-        expect(testInfo.outputPath('')).toContain('hello');
+      const { test } = require('./folio.config');
+      test('test', ({}, testInfo) => {
+        expect(testInfo.outputPath('')).toContain('my-title');
       });
-      const test1 = createTest({ testPathSegment: 'foo-bar' });
-      test1('test', ({testInfo}) => {
-        expect(testInfo.outputPath('')).toContain('foo-bar');
-      });
+    `
+  }, { 'retries': 2 });
+  expect(result.exitCode).toBe(0);
+  expect(result.passed).toBe(1);
+});
+
+test('should remove output paths', async ({runInlineTest}, testInfo) => {
+  const paths: string[] = [];
+  const files: string[] = [];
+
+  for (let i = 0; i < 3; i++) {
+    const p = testInfo.outputPath('path' + i);
+    await fs.promises.mkdir(p, { recursive: true });
+    const f = path.join(p, 'my-file.txt');
+    await fs.promises.writeFile(f, 'contents', 'utf-8');
+    paths.push(p);
+    files.push(f);
+  }
+
+  const result = await runInlineTest({
+    'folio.config.js': `
+      exports.test = folio.test;
+      exports.test.runWith({ outputDir: ${JSON.stringify(paths[0])} });
+      exports.test.runWith({ outputDir: ${JSON.stringify(paths[2])} });
+    `,
+    'a.test.js': `
+      const { test } = require('./folio.config');
+      test('my test', ({}, testInfo) => {});
     `
   });
   expect(result.exitCode).toBe(0);
   expect(result.passed).toBe(2);
+
+  expect(fs.existsSync(files[0])).toBe(false);
+  expect(fs.existsSync(files[1])).toBe(true);
+  expect(fs.existsSync(files[2])).toBe(false);
 });

@@ -14,41 +14,29 @@
  * limitations under the License.
  */
 
-import { test, expect } from './config';
+import { test, expect, stripAscii } from './config';
 
-test('should run tests with different options', async ({ runInlineTest }) => {
+test('render each test with tags', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'folio.config.ts': `
-      global.logs = [];
-      class MyEnv {
-        async beforeEach(args) {
-          return { foo: args.foo || 'foo' };
-        }
-      }
       export const test = folio.test;
-      test.runWith(new MyEnv());
+      test.runWith({ tag: 'foo' });
+      test.runWith({ tag: 'bar' });
     `,
     'a.test.ts': `
       import { test } from './folio.config';
-      test('test', ({ foo }) => {
-        expect(foo).toBe('foo');
+      test('fails', async ({}) => {
+        expect(1).toBe(0);
       });
-
-      test.describe('suite1', () => {
-        test.useOptions({ foo: 'bar' });
-        test('test1', ({ foo }) => {
-          expect(foo).toBe('bar');
-        });
-
-        test.describe('suite2', () => {
-          test.useOptions({ foo: 'baz' });
-          test('test2', ({ foo }) => {
-            expect(foo).toBe('baz');
-          });
-        });
+      test('passes', async ({}) => {
+        expect(0).toBe(0);
       });
-    `
-  });
-  expect(result.exitCode).toBe(0);
-  expect(result.passed).toBe(3);
+    `,
+  }, { reporter: 'list' });
+  const text = stripAscii(result.output);
+  expect(text).toContain('a.test.ts:6:7 › [foo] fails');
+  expect(text).toContain('a.test.ts:6:7 › [bar] fails');
+  expect(text).toContain('a.test.ts:9:7 › [foo] passes');
+  expect(text).toContain('a.test.ts:9:7 › [bar] passes');
+  expect(result.exitCode).toBe(1);
 });

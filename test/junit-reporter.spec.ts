@@ -15,10 +15,9 @@
  */
 
 import xml2js from 'xml2js';
-import { folio } from './fixtures';
-const { it, expect } = folio;
+import { test, expect } from './config';
 
-it('render expected', async ({ runInlineTest }) => {
+test('render expected', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'a.test.js': `
       test('one', async ({}) => {
@@ -43,7 +42,7 @@ it('render expected', async ({ runInlineTest }) => {
   expect(result.exitCode).toBe(0);
 });
 
-it('render unexpected', async ({ runInlineTest }) => {
+test('render unexpected', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'a.test.js': `
       test('one', async ({}) => {
@@ -62,7 +61,7 @@ it('render unexpected', async ({ runInlineTest }) => {
   expect(result.exitCode).toBe(1);
 });
 
-it('render unexpected after retry', async ({ runInlineTest }) => {
+test('render unexpected after retry', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'a.test.js': `
       test('one', async ({}) => {
@@ -79,10 +78,10 @@ it('render unexpected after retry', async ({ runInlineTest }) => {
   expect(result.exitCode).toBe(1);
 });
 
-it('render flaky', async ({ runInlineTest }) => {
+test('render flaky', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'a.test.js': `
-      test('one', async ({testInfo}) => {
+      test('one', async ({}, testInfo) => {
         expect(testInfo.retry).toBe(3);
       });
     `,
@@ -91,28 +90,55 @@ it('render flaky', async ({ runInlineTest }) => {
   expect(result.exitCode).toBe(0);
 });
 
-it('render stdout', async ({ runInlineTest }) => {
+test('render stdout', async ({ runInlineTest }) => {
   const result = await runInlineTest({
-    'a.test.js': `
-      test('one', async ({testInfo}) => {
-        console.log('Hello world');
+    'a.test.ts': `
+      import colors from 'colors/safe';
+      test('one', async ({}) => {
+        console.log(colors.yellow('Hello world'));
+        test.expect("abc").toBe('abcd');
       });
     `,
-  }, { retries: 3, reporter: 'junit' });
+  }, { reporter: 'junit' });
   const xml = parseXML(result.output);
   const suite = xml['testsuites']['testsuite'][0];
   expect(suite['system-out'].length).toBe(1);
   expect(suite['system-out'][0]).toContain('Hello world');
+  expect(suite['system-out'][0]).not.toContain('u00');
+  expect(suite['testcase'][0]['failure'][0]['_']).toContain(`>  8 |         test.expect("abc").toBe('abcd');`);
+  expect(result.exitCode).toBe(1);
+});
+
+test('render stdout without ansi escapes', async ({ runInlineTest }) => {
+  const result = await runInlineTest({
+    'folio.config.ts': `
+      export const test = folio.test;
+      test.runWith();
+      folio.setReporters([new folio.reporters.junit({ stripANSIControlSequences: true })]);
+    `,
+    'a.test.ts': `
+      import colors from 'colors/safe';
+      import { test } from './folio.config';
+      test('one', async ({}) => {
+        console.log(colors.yellow('Hello world'));
+      });
+    `,
+  }, { reporter: '' });
+  const xml = parseXML(result.output);
+  const suite = xml['testsuites']['testsuite'][0];
+  expect(suite['system-out'].length).toBe(1);
+  expect(suite['system-out'][0].trim()).toBe('Hello world');
   expect(result.exitCode).toBe(0);
 });
 
-it('render skipped', async ({ runInlineTest }) => {
+test('render skipped', async ({ runInlineTest }) => {
   const result = await runInlineTest({
     'a.test.js': `
       test('one', async () => {
         console.log('Hello world');
       });
-      test('two', test => test.skip(), async () => {
+      test('two', async () => {
+        test.skip();
         console.log('Hello world');
       });
     `,

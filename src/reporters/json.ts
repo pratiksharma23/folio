@@ -16,8 +16,8 @@
 
 import fs from 'fs';
 import path from 'path';
-import { EmptyReporter } from '../reporter';
-import { Config, Test, Suite, Spec, TestResult, TestError } from '../types';
+import EmptyReporter from './empty';
+import { FullConfig, Test, Suite, Spec, TestResult, TestError } from '../types';
 
 export interface SerializedSuite {
   title: string;
@@ -29,9 +29,8 @@ export interface SerializedSuite {
 }
 
 export type ReportFormat = {
-  config: Config;
-  // TODO: remove the extra object wrapper.
-  errors?: { error: TestError }[];
+  config: FullConfig;
+  errors?: TestError[];
   suites?: SerializedSuite[];
 };
 
@@ -40,11 +39,17 @@ function toPosixPath(aPath: string): string {
 }
 
 class JSONReporter extends EmptyReporter {
-  config: Config;
+  config: FullConfig;
   suite: Suite;
-  private _errors: { error: TestError }[] = [];
+  private _errors: TestError[] = [];
+  private _outputFile: string | undefined;
 
-  onBegin(config: Config, suite: Suite) {
+  constructor(options: { outputFile?: string } = {}) {
+    super();
+    this._outputFile = options.outputFile;
+  }
+
+  onBegin(config: FullConfig, suite: Suite) {
     this.config = config;
     this.suite = suite;
   }
@@ -54,7 +59,7 @@ class JSONReporter extends EmptyReporter {
   }
 
   onError(error: TestError): void {
-    this._errors.push({ error });
+    this._errors.push(error);
   }
 
   onEnd() {
@@ -66,7 +71,7 @@ class JSONReporter extends EmptyReporter {
       },
       suites: this.suite.suites.map(suite => this._serializeSuite(suite)).filter(s => s),
       errors: this._errors
-    });
+    }, this._outputFile);
   }
 
   private _serializeSuite(suite: Suite): null | SerializedSuite {
@@ -96,13 +101,11 @@ class JSONReporter extends EmptyReporter {
 
   private _serializeTest(test: Test) {
     return {
-      slow: test.slow,
       timeout: test.timeout,
       annotations: test.annotations,
       expectedStatus: test.expectedStatus,
-      variation: test.variation,
-      // TODO: rename to results.
-      runs: test.results.map(r => this._serializeTestResult(r))
+      tags: test.tags,
+      results: test.results.map(r => this._serializeTestResult(r)),
     };
   }
 
@@ -120,12 +123,12 @@ class JSONReporter extends EmptyReporter {
   }
 }
 
-function outputReport(report: ReportFormat) {
+function outputReport(report: ReportFormat, outputFile: string | undefined) {
   const reportString = JSON.stringify(report, undefined, 2);
-  const outputName = process.env[`FOLIO_JSON_OUTPUT_NAME`];
-  if (outputName) {
-    fs.mkdirSync(path.dirname(outputName), { recursive: true });
-    fs.writeFileSync(outputName, reportString);
+  outputFile = outputFile || process.env[`FOLIO_JSON_OUTPUT_NAME`];
+  if (outputFile) {
+    fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+    fs.writeFileSync(outputFile, reportString);
   } else {
     console.log(reportString);
   }

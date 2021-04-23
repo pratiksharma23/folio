@@ -1,11 +1,11 @@
 /**
- * Copyright (c) Microsoft Corporation.
+ * Copyright Microsoft Corporation. All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- * http://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,17 +14,12 @@
  * limitations under the License.
  */
 
-import { folio, stripAscii } from './fixtures';
-const { it, expect } = folio;
+import { TestInfo } from './types';
 
-it('should handle test() spec', async ({ runInlineTest }) => {
-  const result = await runInlineTest({
-    'a.test.js': `
-      test('test', async ({}) => {
-        expect(1).toBe(1);
-      });
-    `,
-  });
-  expect(result.exitCode).toBe(0);
-  expect(result.passed).toBe(1);
-});
+let currentTestInfoValue: TestInfo | null = null;
+export function setCurrentTestInfo(testInfo: TestInfo | null) {
+  currentTestInfoValue = testInfo;
+}
+export function currentTestInfo(): TestInfo | null {
+  return currentTestInfoValue;
+}

@@ -20,15 +20,14 @@ import fs from 'fs';
 import milliseconds from 'ms';
 import path from 'path';
 import StackUtils from 'stack-utils';
-import { Reporter } from '../runner';
-import { TestStatus, Test, Suite, TestResult, TestError } from '../types';
-import { Config } from '../types';
+import { TestStatus, Test, Suite, TestResult, TestError, Reporter } from '../types';
+import { FullConfig } from '../types';
 
 const stackUtils = new StackUtils();
 
 export class BaseReporter implements Reporter  {
   duration = 0;
-  config: Config;
+  config: FullConfig;
   suite: Suite;
   timeout: number;
   fileDurations = new Map<string, number>();
@@ -37,7 +36,7 @@ export class BaseReporter implements Reporter  {
   constructor() {
   }
 
-  onBegin(config: Config, suite: Suite) {
+  onBegin(config: FullConfig, suite: Suite) {
     this.monotonicStartTime = monotonicTime();
     this.config = config;
     this.suite = suite;
@@ -147,11 +146,11 @@ export class BaseReporter implements Reporter  {
   }
 
   willRetry(test: Test, result: TestResult): boolean {
-    return result.status !== 'passed' && result.status !== test.expectedStatus && test.results.length <= this.config.retries;
+    return result.status !== 'passed' && result.status !== test.expectedStatus && test.results.length <= test.retries;
   }
 }
 
-export function formatFailure(config: Config, test: Test, index?: number): string {
+export function formatFailure(config: FullConfig, test: Test, index?: number): string {
   const tokens: string[] = [];
   tokens.push(formatTestHeader(config, test, '  ', index));
   for (const result of test.results) {
@@ -163,19 +162,19 @@ export function formatFailure(config: Config, test: Test, index?: number): strin
   return tokens.join('\n');
 }
 
-function formatTestHeader(config: Config, test: Test, indent: string, index?: number): string {
-  const tokens: string[] = [];
+export function formatTestTitle(config: FullConfig, test: Test): string {
   const spec = test.spec;
   let relativePath = path.relative(config.testDir, spec.file) || path.basename(spec.file);
   relativePath += ':' + spec.line + ':' + spec.column;
-  const passedUnexpectedlySuffix = test.results[0].status === 'passed' ? ' -- passed unexpectedly' : '';
-  const header = `${indent}${index ? index + ') ' : ''}${relativePath} › ${spec.fullTitle()}${passedUnexpectedlySuffix}`;
-  tokens.push(colors.red(pad(header, '=')));
+  const tags = test.tags.length ? `[${test.tags.join(',')}] ` : '';
+  return `${relativePath} › ${tags}${spec.fullTitle()}`;
+}
 
-  // Print variation.
-  if (Object.keys(test.variation).length)
-    tokens.push(indent + (index ? ' '.repeat(String(index).length + 2) : '') + colors.gray(serializeVariation(test.variation)));
-  return tokens.join('\n');
+function formatTestHeader(config: FullConfig, test: Test, indent: string, index?: number): string {
+  const title = formatTestTitle(config, test);
+  const passedUnexpectedlySuffix = test.results[0].status === 'passed' ? ' -- passed unexpectedly' : '';
+  const header = `${indent}${index ? index + ') ' : ''}${title}${passedUnexpectedlySuffix}`;
+  return colors.red(pad(header, '='));
 }
 
 function formatResult(test: Test, result: TestResult): string {
@@ -237,13 +236,6 @@ function positionInFile(stack: string, file: string): { column: number; line: nu
       return {column: parsed.column, line: parsed.line};
   }
   return null;
-}
-
-export function serializeVariation(variation: folio.SuiteVariation): string {
-  const tokens = [];
-  for (const name of Object.keys(variation))
-    tokens.push(`${name}=${variation[name]}`);
-  return tokens.join(', ');
 }
 
 function monotonicTime(): number {

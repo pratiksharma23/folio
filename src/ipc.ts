@@ -19,10 +19,11 @@ export type { TestStatus } from './types';
 
 export type WorkerInitParams = {
   workerIndex: number;
-  fixtureFiles: string[];
-  variation: folio.SuiteVariation;
   repeatEachIndex: number;
-  config: Config;
+  runListIndex: number;
+  loader: {
+    configs: (string | Config)[];
+  };
 };
 
 export type TestBeginPayload = {
@@ -33,17 +34,17 @@ export type TestBeginPayload = {
 export type TestEndPayload = {
   testId: string;
   duration: number;
-  status?: TestStatus;
+  status: TestStatus;
   error?: TestError;
   data: any;
+  expectedStatus: TestStatus;
+  annotations: any[];
+  timeout: number;
 };
 
 export type TestEntry = {
   testId: string;
   retry: number;
-  timeout: number;
-  expectedStatus: TestStatus;
-  skipped: boolean;
 };
 
 export type RunPayload = {

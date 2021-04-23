@@ -13,17 +13,17 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { folio } from './fixtures';
-const { it, expect } = folio;
 
-it('should get top level stdio', async ({runInlineTest}) => {
+import { test, expect } from './config';
+
+test('should get top level stdio', async ({runInlineTest}) => {
   const result = await runInlineTest({
     'a.spec.js': `
-      console.log('%% top level stdout');
-      console.error('%% top level stderr');
+      console.log('\\n%% top level stdout');
+      console.error('\\n%% top level stderr');
       test('is a test', () => {
-        console.log('%% stdout in a test');
-        console.error('%% stderr in a test');
+        console.log('\\n%% stdout in a test');
+        console.error('\\n%% stderr in a test');
       });
     `
   });
@@ -37,19 +37,22 @@ it('should get top level stdio', async ({runInlineTest}) => {
   ]);
 });
 
-it('should get stdio from worker fixture teardown', async ({runInlineTest}) => {
+test('should get stdio from env afterAll', async ({runInlineTest}) => {
   const result = await runInlineTest({
-    'fixtures.js': `
-      async function fixture({}, runTest) {
-        console.log('\\n%% worker setup');
-        await runTest();
-        console.log('\\n%% worker teardown');
+    'folio.config.ts': `
+      class MyEnv {
+        async beforeAll() {
+          console.log('\\n%% worker setup');
+        }
+        async afterAll() {
+          console.log('\\n%% worker teardown');
+        }
       }
-      exports.toBeRenamed = {
-        workerFixtures: { fixture }
-      };
+      export const test = folio.test;
+      test.runWith(new MyEnv());
     `,
     'a.spec.js': `
+      const { test } = require('./folio.config');
       test('is a test', async ({fixture}) => {});
     `
   });

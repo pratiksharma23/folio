@@ -18,17 +18,11 @@
 import rimraf from 'rimraf';
 import { promisify } from 'util';
 import { Dispatcher } from './dispatcher';
-import { config } from './fixtures';
-import { Reporter } from './reporter';
-import { generateTests } from './testGenerator';
-import { monotonicTime, prependErrorMessage, raceAgainstDeadline } from './util';
-import { debugLog } from './debug';
-import { RootSuite, Suite } from './test';
-import { FixtureLoader } from './fixtureLoader';
-import { installTransform } from './transform';
-import { clearCurrentFile, setCurrentFile } from './spec';
-export { Reporter } from './reporter';
-export { Test, TestResult, Suite, TestStatus, TestError } from './types';
+import { Reporter } from './types';
+import { createMatcher, monotonicTime, raceAgainstDeadline } from './util';
+import { Suite, TestVariation } from './test';
+import { Loader } from './loader';
+import { Multiplexer } from './reporters/multiplexer';
 
 const removeFolderAsync = promisify(rimraf);
 
@@ -36,78 +30,103 @@ type RunResult = 'passed' | 'failed' | 'sigint' | 'forbid-only' | 'no-tests';
 
 export class Runner {
   private _reporter: Reporter;
-  private _suites: RootSuite[] = [];
-  private _fixtureLoader: FixtureLoader;
-  private _rootSuite: Suite;
+  private _loader: Loader;
+  private _didBegin = false;
 
-  constructor(reporter: Reporter) {
-    this._reporter = reporter;
-    this._fixtureLoader = new FixtureLoader();
+  constructor(loader: Loader) {
+    this._loader = loader;
+    this._reporter = new Multiplexer(loader.reporters());
   }
 
-  loadFixtures(files: string[]) {
-    debugLog(`loadFixtures`, files);
-    for (const file of files) {
-      try {
-        this._fixtureLoader.loadFixtureFile(file);
-      } catch (e) {
-        prependErrorMessage(e, `Error while reading ${file}:\n`);
-        throw e;
+  private _loadSuite(testFiles: string[], tagFilter?: string[]): Suite {
+    for (const file of testFiles)
+      this._loader.loadTestFile(file);
+
+    // This makes sure we don't generate 1000000 tests if only one spec is focused.
+    const filtered = new Set<Suite>();
+    for (const runList of this._loader.runLists()) {
+      for (const description of this._loader.descriptionsForRunList(runList)) {
+        for (const fileSuite of description.fileSuites.values()) {
+          if (fileSuite._hasOnly())
+            filtered.add(fileSuite);
+        }
       }
     }
-    this._fixtureLoader.finish();
-  }
 
-  loadFiles(files: string[]) {
-    debugLog(`loadFiles`, files);
-    for (const file of files) {
-      const revertBabelRequire = installTransform();
-      setCurrentFile(file, this._suites, this._fixtureLoader.fixturePool);
-      try {
-        require(file);
-      } catch (e) {
-        prependErrorMessage(e, `Error while reading ${file}:\n`);
-        throw e;
+    const rootSuite = new Suite('');
+    const grepMatcher = createMatcher(this._loader.config().grep);
+
+    const nonEmptySuites = new Set<Suite>();
+    for (const runList of this._loader.runLists()) {
+      if (tagFilter && !runList.tags.some(tag => tagFilter.includes(tag)))
+        continue;
+      for (const description of this._loader.descriptionsForRunList(runList)) {
+        for (const fileSuite of description.fileSuites.values()) {
+          if (filtered.size && !filtered.has(fileSuite))
+            continue;
+          const specs = fileSuite._allSpecs().filter(spec => grepMatcher(spec.fullTitle()));
+          if (!specs.length)
+            continue;
+          const config = this._loader.config(runList);
+          for (const spec of specs) {
+            for (let i = 0; i < config.repeatEach; ++i) {
+              const testVariation: TestVariation = {
+                tags: runList.tags,
+                retries: config.retries,
+                outputDir: config.outputDir,
+                repeatEachIndex: i,
+                runListIndex: runList.index,
+                workerHash: `#list-${runList.index}#env-${description.envHash}#repeat-${i}`,
+                variationId: `#run-${runList.index}#repeat-${i}`,
+              };
+              spec._appendTest(testVariation);
+            }
+          }
+          nonEmptySuites.add(fileSuite);
+        }
       }
-      clearCurrentFile();
-      revertBabelRequire();
     }
+    for (const fileSuite of nonEmptySuites)
+      rootSuite._addSuite(fileSuite);
+
+    filterOnly(rootSuite);
+    return rootSuite;
   }
 
-  generateTests() {
-    this._suites = excludeNonOnlyFiles(this._suites);
-    this._rootSuite = generateTests(this._suites, config, this._fixtureLoader);
-  }
-
-  list() {
-    this._reporter.onBegin(config, this._rootSuite);
-    this._reporter.onEnd();
-  }
-
-  async run(): Promise<RunResult> {
-    await removeFolderAsync(config.outputDir).catch(e => {});
-
-    if (config.forbidOnly) {
-      const hasOnly = this._rootSuite.findSpec(t => t._only) || this._rootSuite.findSuite(s => s._only);
-      if (hasOnly)
-        return 'forbid-only';
-    }
-
-    const total = this._rootSuite.totalTestCount();
-    if (!total)
-      return 'no-tests';
-    const globalDeadline = config.globalTimeout ? config.globalTimeout + monotonicTime() : 0;
-    const { result, timedOut } = await raceAgainstDeadline(this._runTests(this._rootSuite), globalDeadline);
+  async run(list: boolean, testFiles: string[], tagFilter?: string[]): Promise<RunResult> {
+    const globalDeadline = this._loader.config().globalTimeout ? this._loader.config().globalTimeout + monotonicTime() : undefined;
+    const { result, timedOut } = await raceAgainstDeadline(this._run(list, testFiles, tagFilter), globalDeadline);
     if (timedOut) {
-      this._reporter.onTimeout(config.globalTimeout);
+      if (!this._didBegin)
+        this._reporter.onBegin(this._loader.config(), new Suite(''));
+      this._reporter.onTimeout(this._loader.config().globalTimeout);
       process.exit(1);
     }
     return result;
   }
 
-  private async _runTests(suite: Suite): Promise<RunResult> {
-    // Trial run does not need many workers, use one.
-    const runner = new Dispatcher(suite, config, this._fixtureLoader.fixtureFiles, this._reporter);
+  private async _run(list: boolean, testFiles: string[], tagFilter?: string[]): Promise<RunResult> {
+    for (const globalSetup of this._loader.globalSetups())
+      await globalSetup();
+
+    const rootSuite = this._loadSuite(testFiles, tagFilter);
+
+    if (this._loader.config().forbidOnly) {
+      const hasOnly = rootSuite.findSpec(t => t._only) || rootSuite.findSuite(s => s._only);
+      if (hasOnly)
+        return 'forbid-only';
+    }
+
+    const outputDirs = new Set<string>();
+    rootSuite.findTest(test => {
+      outputDirs.add(test._variation.outputDir);
+    });
+    await Promise.all(Array.from(outputDirs).map(outputDir => removeFolderAsync(outputDir).catch(e => {})));
+
+    const total = rootSuite.totalTestCount();
+    if (!total)
+      return 'no-tests';
+
     let sigint = false;
     let sigintCallback: () => void;
     const sigIntPromise = new Promise<void>(f => sigintCallback = f);
@@ -117,18 +136,45 @@ export class Runner {
       sigintCallback();
     };
     process.on('SIGINT', sigintHandler);
-    this._reporter.onBegin(config, suite);
-    await Promise.race([runner.run(), sigIntPromise]);
-    await runner.stop();
+
+    if (process.stdout.isTTY) {
+      const workers = new Set();
+      rootSuite.findTest(test => {
+        workers.add(test.spec.file + test._variation.workerHash);
+      });
+      console.log();
+      const jobs = Math.min(this._loader.config().workers, workers.size);
+      const shard = this._loader.config().shard;
+      const shardDetails = shard ? `, shard ${shard.current + 1} of ${shard.total}` : '';
+      console.log(`Running ${total} test${total > 1 ? 's' : ''} using ${jobs} worker${jobs > 1 ? 's' : ''}${shardDetails}`);
+    }
+
+    this._reporter.onBegin(this._loader.config(), rootSuite);
+    this._didBegin = true;
+    let hasWorkerErrors = false;
+    if (!list) {
+      const dispatcher = new Dispatcher(this._loader, rootSuite, this._reporter);
+      await Promise.race([dispatcher.run(), sigIntPromise]);
+      await dispatcher.stop();
+      hasWorkerErrors = dispatcher.hasWorkerErrors();
+    }
     this._reporter.onEnd();
+
+    for (const globalTeardown of this._loader.globalTeardowns())
+      await globalTeardown();
     if (sigint)
       return 'sigint';
-    return runner.hasWorkerErrors() || suite.findSpec(spec => !spec.ok()) ? 'failed' : 'passed';
+    return hasWorkerErrors || rootSuite.findSpec(spec => !spec.ok()) ? 'failed' : 'passed';
   }
 }
 
-function excludeNonOnlyFiles(suites: RootSuite[]): RootSuite[] {
-  // This makes sure we don't generate 1000000 tests if only one spec is focused.
-  const filtered = suites.filter(suite => suite._hasOnly());
-  return filtered.length === 0 ? suites : filtered;
+function filterOnly(suite: Suite) {
+  const onlySuites = suite.suites.filter(child => filterOnly(child) || child._only);
+  const onlyTests = suite.specs.filter(spec => spec._only);
+  if (onlySuites.length || onlyTests.length) {
+    suite.suites = onlySuites;
+    suite.specs = onlyTests;
+    return true;
+  }
+  return false;
 }

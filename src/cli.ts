@@ -17,20 +17,20 @@
 import { default as ignore } from 'fstream-ignore';
 import * as commander from 'commander';
 import * as fs from 'fs';
-import { default as minimatch } from 'minimatch';
 import * as path from 'path';
-import { Reporter, EmptyReporter } from './reporter';
+import EmptyReporter from './reporters/empty';
 import DotReporter from './reporters/dot';
 import JSONReporter from './reporters/json';
 import JUnitReporter from './reporters/junit';
 import LineReporter from './reporters/line';
 import ListReporter from './reporters/list';
-import { Multiplexer } from './reporters/multiplexer';
 import { Runner } from './runner';
-import { assignConfig, config } from './fixtures';
-import { defaultConfig } from './config';
+import { Config, FullConfig, Reporter } from './types';
+import { Loader } from './loader';
+import { createMatcher } from './util';
+import { setReporters } from './spec';
 
-export const reporters = {
+export const reporters: { [name: string]: new () => Reporter } = {
   'dot': DotReporter,
   'json': JSONReporter,
   'junit': JUnitReporter,
@@ -41,9 +41,28 @@ export const reporters = {
 
 const availableReporters = Object.keys(reporters).map(r => `"${r}"`).join();
 
+const defaultConfig: FullConfig = {
+  forbidOnly: false,
+  globalTimeout: 0,
+  grep: /.*/,
+  maxFailures: 0,
+  outputDir: path.resolve(process.cwd(), 'test-results'),
+  quiet: false,
+  repeatEach: 1,
+  retries: 0,
+  shard: null,
+  snapshotDir: '__snapshots__',
+  testDir: path.resolve(process.cwd()),
+  testIgnore: 'node_modules/**',
+  testMatch: '**/?(*.)+(spec|test).[jt]s',
+  timeout: 10000,
+  updateSnapshots: false,
+  workers: Math.ceil(require('os').cpus().length / 2),
+};
+
 const loadProgram = new commander.Command();
-addRunnerOptions(loadProgram);
 loadProgram.helpOption(false);
+addRunnerOptions(loadProgram);
 loadProgram.action(async command => {
   try {
     await runTests(command);
@@ -54,82 +73,80 @@ loadProgram.action(async command => {
 });
 loadProgram.parse(process.argv);
 
-async function runTests(command) {
-  assignConfig(defaultConfig);
-
-  let shard: { total: number, current: number } | undefined;
-  if (command.shard) {
-    const pair = command.shard.split('/').map((t: string) => parseInt(t, 10));
-    shard = { current: pair[0] - 1, total: pair[1] };
+async function runTests(command: any) {
+  if (command.help === undefined) {
+    console.log(loadProgram.helpInformation());
+    process.exit(0);
   }
-  const testDir = path.resolve(process.cwd(), command.args[0] || '.');
-  const reporterList = command.reporter.split(',');
-  const reporterObjects: Reporter[] = reporterList.map(c => {
-    if (reporters[c])
-      return new reporters[c]();
-    try {
-      const p = path.resolve(process.cwd(), c);
-      return new (require(p).default)();
-    } catch (e) {
-      console.error('Invalid reporter ' + c, e);
-      process.exit(1);
-    }
-  });
 
+  setReporters(process.env.CI ? [new DotReporter()] : [new LineReporter()]);
+
+  const loader = new Loader();
+  loader.addConfig(defaultConfig);
+
+  function loadConfig(configName: string) {
+    const configFile = path.resolve(process.cwd(), configName);
+    if (fs.existsSync(configFile)) {
+      loader.addConfig({ testDir: path.dirname(configFile) });
+      loader.loadConfigFile(configFile);
+      return true;
+    }
+    return false;
+  }
+
+  if (command.config) {
+    if (!loadConfig(command.config))
+      throw new Error(`${command.config} does not exist`);
+  } else if (!loadConfig('folio.config.ts') && !loadConfig('folio.config.js')) {
+    throw new Error(`Configuration file not found. Either pass --config, or create folio.config.(js|ts) file`);
+  }
+
+  loader.addConfig(configFromCommand(command));
+  loader.addConfig({ testMatch: normalizeFilePatterns(loader.config().testMatch) });
+  loader.addConfig({ testIgnore: normalizeFilePatterns(loader.config().testIgnore) });
+
+  const testDir = loader.config().testDir;
   if (!fs.existsSync(testDir))
     throw new Error(`${testDir} does not exist`);
   if (!fs.statSync(testDir).isDirectory())
     throw new Error(`${testDir} is not a directory`);
 
+  const testFileFilter: string[] = command.args;
   const allFiles = await collectFiles(testDir);
-  const testFiles = filterFiles(testDir, allFiles, command.args.slice(1), command.testMatch, command.testIgnore);
-  const fixtureFiles = filterFiles(testDir, allFiles, [], command.fixtureMatch, command.fixtureIgnore);
+  const testFiles = filterFiles(testDir, allFiles, testFileFilter, createMatcher(loader.config().testMatch), createMatcher(loader.config().testIgnore));
 
-  const reporter = new Multiplexer(reporterObjects);
-  const runner = new Runner(reporter);
-  runner.loadFixtures(fixtureFiles);
-  runner.loadFiles(testFiles);
-
-  // Assign config values after runner.loadFiles to set defaults from the command
-  // line.
-  config.testDir = testDir;
-  if (command.forbidOnly)
-    config.forbidOnly = true;
-  if (command.globalTimeout)
-    config.globalTimeout = parseInt(command.globalTimeout, 10);
-  if (command.grep)
-    config.grep = command.grep;
-  if (command.maxFailures || command.x)
-    config.maxFailures = command.x ? 1 : parseInt(command.maxFailures, 10);
-  if (command.output)
-    config.outputDir = command.output;
-  if (command.quiet)
-    config.quiet = command.quiet;
-  if (command.repeatEach)
-    config.repeatEach = parseInt(command.repeatEach, 10);
-  if (command.retries)
-    config.retries = parseInt(command.retries, 10);
-  if (shard)
-    config.shard = shard;
-  if (command.snapshotDir)
-    config.snapshotDir = command.snapshotDir;
-  if (command.timeout)
-    config.timeout = parseInt(command.timeout, 10);
-  if (command.updateSnapshots)
-    config.updateSnapshots = !!command.updateSnapshots;
-  if (command.workers)
-    config.workers = parseInt(command.workers, 10);
-
-  runner.generateTests();
-  if (command.list) {
-    runner.list();
-    return;
+  if (command.reporter && command.reporter.length) {
+    const reporterList: string[] = command.reporter.split(',');
+    setReporters(reporterList.map(c => {
+      if (reporters[c])
+        return new reporters[c]();
+      try {
+        const p = path.resolve(process.cwd(), c);
+        return new (require(p).default)();
+      } catch (e) {
+        console.error('Invalid reporter ' + c, e);
+        process.exit(1);
+      }
+    }));
   }
 
-  const result = await runner.run();
+  const runner = new Runner(loader);
+  const tagFilter = command.tag && command.tag.length ? command.tag : undefined;
+  const result = await runner.run(!!command.list, testFiles, tagFilter);
+
+  // Calling process.exit() might truncate large stdout/stderr output.
+  // See https://github.com/nodejs/node/issues/6456.
+  //
+  // We can use writableNeedDrain to workaround this, but it is only available
+  // since node v15.2.0.
+  // See https://nodejs.org/api/stream.html#stream_writable_writableneeddrain.
+  if ((process.stdout as any).writableNeedDrain)
+    await new Promise(f => process.stdout.on('drain', f));
+  if ((process.stderr as any).writableNeedDrain)
+    await new Promise(f => process.stderr.on('drain', f));
+
   if (result === 'sigint')
     process.exit(130);
-
   if (result === 'forbid-only') {
     console.error('=====================================');
     console.error(' --forbid-only found a focused test.');
@@ -147,7 +164,7 @@ async function runTests(command) {
 
 async function collectFiles(testDir: string): Promise<string[]> {
   const entries: any[] = [];
-  let callback: () => void;
+  let callback = () => {};
   const promise = new Promise<void>(f => callback = f);
   ignore({ path: testDir, ignoreFiles: ['.gitignore'] })
       .on('child', (entry: any) => entries.push(entry))
@@ -160,16 +177,12 @@ async function collectFiles(testDir: string): Promise<string[]> {
   }).map(e => e.path);
 }
 
-function filterFiles(base: string, files: string[], filters: string[], filesMatch: string, filesIgnore: string): string[] {
-  if (!filesIgnore.includes('/') && !filesIgnore.includes('\\'))
-    filesIgnore = '**/' + filesIgnore;
-  if (!filesMatch.includes('/') && !filesMatch.includes('\\'))
-    filesMatch = '**/' + filesMatch;
+function filterFiles(base: string, files: string[], filters: string[], filesMatch: (value: string) => boolean, filesIgnore: (value: string) => boolean): string[] {
   return files.filter(file => {
     file = path.relative(base, file);
-    if (filesIgnore && minimatch(file, filesIgnore))
+    if (filesIgnore(file))
       return false;
-    if (filesMatch && !minimatch(file, filesMatch))
+    if (!filesMatch(file))
       return false;
     if (filters.length && !filters.find(filter => file.includes(filter)))
       return false;
@@ -180,11 +193,10 @@ function filterFiles(base: string, files: string[], filters: string[], filesMatc
 function addRunnerOptions(program: commander.Command) {
   program = program
       .version('Version ' + /** @type {any} */ (require)('../package.json').version)
+      .option('-c, --config <file>', `Configuration file (default: "folio.config.ts" or "folio.config.js")`)
       .option('--forbid-only', `Fail if exclusive test(s) encountered (default: ${defaultConfig.forbidOnly})`)
-      .option('-g, --grep <grep>', `Only run tests matching this string or regexp  (default: "${defaultConfig.grep}")`)
+      .option('-g, --grep <grep>', `Only run tests matching this regular expression (default: "${defaultConfig.grep}")`)
       .option('--global-timeout <timeout>', `Specify maximum time this test suite can run in milliseconds (default: 0 for unlimited)`)
-      .option('--fixture-ignore <pattern>', `Pattern used to ignore fixture files`, 'node_modules/**')
-      .option('--fixture-match <pattern>', `Pattern used to find fixture files`, '**/?(*.)fixtures.[jt]s')
       .option('-h, --help', `Display help`)
       .option('-j, --workers <workers>', `Number of concurrent workers, use 1 to run in single worker (default: number of CPU cores / 2)`)
       .option('--list', `Only collect all the test and report them`)
@@ -192,13 +204,82 @@ function addRunnerOptions(program: commander.Command) {
       .option('--output <dir>', `Folder for output artifacts (default: "test-results")`)
       .option('--quiet', `Suppress stdio`)
       .option('--repeat-each <repeat-each>', `Specify how many times to run the tests (default: ${defaultConfig.repeatEach})`)
-      .option('--reporter <reporter>', `Specify reporter to use, comma-separated, can be ${availableReporters}`, process.env.CI ? 'dot' : 'line')
+      .option('--reporter <reporter>', `Specify reporter to use, comma-separated, can be ${availableReporters} (default: "${process.env.CI ? 'dot' : 'line'}")`)
       .option('--retries <retries>', `Specify retry count (default: ${defaultConfig.retries})`)
       .option('--shard <shard>', `Shard tests and execute only selected shard, specify in the form "current/all", 1-based, for example "3/5"`)
       .option('--snapshot-dir <dir>', `Snapshot directory, relative to tests directory (default: "${defaultConfig.snapshotDir}"`)
-      .option('--test-ignore <pattern>', `Pattern used to ignore test files`, 'node_modules/**')
-      .option('--test-match <pattern>', `Pattern used to find test files`, '**/?(*.)+(spec|test).[jt]s')
+      .option('--tag <tag...>', `Only run tests tagged with one of the specified tags (default: all tests)`)
+      .option('--test-dir <dir>', `Directory containing test files (default: current directory)`)
+      .option('--test-ignore <pattern>', `Pattern used to ignore test files (default: "${defaultConfig.testIgnore}")`)
+      .option('--test-match <pattern>', `Pattern used to find test files (default: "${defaultConfig.testMatch}")`)
       .option('--timeout <timeout>', `Specify test timeout threshold in milliseconds (default: ${defaultConfig.timeout})`)
       .option('-u, --update-snapshots', `Whether to update snapshots with actual results (default: ${defaultConfig.updateSnapshots})`)
       .option('-x', `Stop after the first failure`);
+}
+
+function configFromCommand(command: any): Config {
+  const config: Config = {};
+  if (command.forbidOnly)
+    config.forbidOnly = true;
+  if (command.globalTimeout)
+    config.globalTimeout = parseInt(command.globalTimeout, 10);
+  if (command.grep)
+    config.grep = forceRegExp(command.grep);
+  if (command.maxFailures || command.x)
+    config.maxFailures = command.x ? 1 : parseInt(command.maxFailures, 10);
+  if (command.output)
+    config.outputDir = path.resolve(process.cwd(), command.output);
+  if (command.quiet)
+    config.quiet = command.quiet;
+  if (command.repeatEach)
+    config.repeatEach = parseInt(command.repeatEach, 10);
+  if (command.retries)
+    config.retries = parseInt(command.retries, 10);
+  if (command.shard) {
+    const pair = command.shard.split('/').map((t: string) => parseInt(t, 10));
+    config.shard = { current: pair[0] - 1, total: pair[1] };
+  }
+  if (command.snapshotDir)
+    config.snapshotDir = command.snapshotDir;
+  if (command.testDir)
+    config.testDir = path.resolve(process.cwd(), command.testDir);
+  if (command.testMatch)
+    config.testMatch = maybeRegExp(command.testMatch);
+  if (command.testIgnore)
+    config.testIgnore = maybeRegExp(command.testIgnore);
+  if (command.timeout)
+    config.timeout = parseInt(command.timeout, 10);
+  if (command.updateSnapshots)
+    config.updateSnapshots = !!command.updateSnapshots;
+  if (command.workers)
+    config.workers = parseInt(command.workers, 10);
+  return config;
+}
+
+function normalizeFilePattern(pattern: string): string {
+  if (!pattern.includes('/') && !pattern.includes('\\'))
+    pattern = '**/' + pattern;
+  return pattern;
+}
+
+function normalizeFilePatterns(patterns: string | RegExp | (string | RegExp)[]) {
+  if (typeof patterns === 'string')
+    patterns = normalizeFilePattern(patterns);
+  else if (Array.isArray(patterns))
+    patterns = patterns.map(item => typeof item === 'string' ? normalizeFilePattern(item) : item);
+  return patterns;
+}
+
+function maybeRegExp(pattern: string): string | RegExp {
+  const match = pattern.match(/^\/(.*)\/([gi]*)$/);
+  if (match)
+    return new RegExp(match[1], match[2]);
+  return pattern;
+}
+
+function forceRegExp(pattern: string): RegExp {
+  const match = pattern.match(/^\/(.*)\/([gi]*)$/);
+  if (match)
+    return new RegExp(match[1], match[2]);
+  return new RegExp(pattern, 'g');
 }

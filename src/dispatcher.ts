@@ -18,15 +18,15 @@ import child_process from 'child_process';
 import path from 'path';
 import { EventEmitter } from 'events';
 import { RunPayload, TestBeginPayload, TestEndPayload, DonePayload, TestOutputPayload, TestStatus, WorkerInitParams } from './ipc';
-import { Config, TestResult } from './types';
-import { Reporter } from './reporter';
+import { TestResult, Reporter } from './types';
 import { Suite, Test } from './test';
+import { Loader } from './loader';
 
 type DispatcherEntry = {
   runPayload: RunPayload;
-  variation: folio.SuiteVariation;
   hash: string;
   repeatEachIndex: number;
+  runListIndex: number;
 };
 
 export class Dispatcher {
@@ -37,17 +37,15 @@ export class Dispatcher {
   private _testById = new Map<string, { test: Test, result: TestResult }>();
   private _queue: DispatcherEntry[] = [];
   private _stopCallback: () => void;
-  readonly _config: Config;
-  readonly _fixtureFiles: string[];
+  readonly _loader: Loader;
   private _suite: Suite;
   private _reporter: Reporter;
   private _hasWorkerErrors = false;
   private _isStopped = false;
   private _failureCount = 0;
 
-  constructor(suite: Suite, config: Config, fixtureFiles: string[], reporter: Reporter) {
-    this._config = config;
-    this._fixtureFiles = fixtureFiles;
+  constructor(loader: Loader, suite: Suite, reporter: Reporter) {
+    this._loader = loader;
     this._reporter = reporter;
 
     this._suite = suite;
@@ -61,15 +59,14 @@ export class Dispatcher {
     this._queue = this._filesSortedByWorkerHash();
 
     // Shard tests.
-    let total = this._suite.totalTestCount();
-    let shardDetails = '';
-    if (this._config.shard) {
-      total = 0;
-      const shardSize = Math.ceil(total / this._config.shard.total);
-      const from = shardSize * this._config.shard.current;
-      const to = shardSize * (this._config.shard.current + 1);
-      shardDetails = `, shard ${this._config.shard.current + 1} of ${this._config.shard.total}`;
+    const shard = this._loader.config().shard;
+    if (shard) {
+      let total = this._suite.totalTestCount();
+      const shardSize = Math.ceil(total / shard.total);
+      const from = shardSize * shard.current;
+      const to = shardSize * (shard.current + 1);
       let current = 0;
+      total = 0;
       const filteredQueue: DispatcherEntry[] = [];
       for (const entry of this._queue) {
         if (current >= from && current < to) {
@@ -80,63 +77,43 @@ export class Dispatcher {
       }
       this._queue = filteredQueue;
     }
-
-    if (process.stdout.isTTY) {
-      const workers = new Set<string>();
-      suite.findSpec(test => {
-        for (const variant of test.tests)
-          workers.add(test.file + variant._workerHash);
-      });
-      console.log();
-      const jobs = Math.min(config.workers, workers.size);
-      console.log(`Running ${total} test${total > 1 ? 's' : ''} using ${jobs} worker${jobs > 1 ? 's' : ''}${shardDetails}`);
-    }
   }
 
   _filesSortedByWorkerHash(): DispatcherEntry[] {
-    const result: DispatcherEntry[] = [];
+    const entriesByWorkerHashAndFile = new Map<string, Map<string, DispatcherEntry>>();
     for (const suite of this._suite.suites) {
-      const testsByWorkerHash = new Map<string, {
-        tests: Test[],
-        variation: folio.SuiteVariation,
-        repeatEachIndex: number,
-      }>();
       for (const spec of suite._allSpecs()) {
         for (const test of spec.tests) {
-          let entry = testsByWorkerHash.get(test._workerHash);
+          let entriesByFile = entriesByWorkerHashAndFile.get(test._variation.workerHash);
+          if (!entriesByFile) {
+            entriesByFile = new Map();
+            entriesByWorkerHashAndFile.set(test._variation.workerHash, entriesByFile);
+          }
+          let entry = entriesByFile.get(spec.file);
           if (!entry) {
             entry = {
-              tests: [],
-              variation: test.variation,
-              repeatEachIndex: test._repeatEachIndex,
+              runPayload: {
+                entries: [],
+                file: spec.file,
+              },
+              repeatEachIndex: test._variation.repeatEachIndex,
+              runListIndex: test._variation.runListIndex,
+              hash: test._variation.workerHash,
             };
-            testsByWorkerHash.set(test._workerHash, entry);
+            entriesByFile.set(spec.file, entry);
           }
-          entry.tests.push(test);
-        }
-      }
-      if (!testsByWorkerHash.size)
-        continue;
-      for (const [hash, entry] of testsByWorkerHash) {
-        const entries = entry.tests.map(test => {
-          return {
+          entry.runPayload.entries.push({
             retry: this._testById.get(test._id).result.retry,
             testId: test._id,
-            expectedStatus: test.expectedStatus,
-            timeout: test.timeout,
-            skipped: test.skipped
-          };
-        });
-        result.push({
-          variation: entry.variation,
-          runPayload: {
-            entries,
-            file: suite.file,
-          },
-          repeatEachIndex: entry.repeatEachIndex,
-          hash,
-        });
+          });
+        }
       }
+    }
+
+    const result: DispatcherEntry[] = [];
+    for (const entriesByFile of entriesByWorkerHashAndFile.values()) {
+      for (const entry of entriesByFile.values())
+        result.push(entry);
     }
     result.sort((a, b) => a.hash < b.hash ? -1 : (a.hash === b.hash ? 0 : 1));
     return result;
@@ -186,32 +163,33 @@ export class Dispatcher {
       // When worker encounters error, we will stop it and create a new one.
       worker.stop();
 
-      // In case of fatal error, we are done with the entry.
+      let remaining = params.remaining;
+      const failedTestIds = new Set<string>();
+
+      // In case of fatal error, report all remaining tests as failing with this error.
       if (params.fatalError) {
-        // Report all the tests are failing with this error.
-        for (const { testId } of entry.runPayload.entries) {
+        for (const { testId } of remaining) {
           const { test, result } = this._testById.get(testId);
           this._reporter.onTestBegin(test);
           result.error = params.fatalError;
           this._reportTestEnd(test, result, 'failed');
+          failedTestIds.add(testId);
         }
-        doneCallback();
-        return;
+        // Since we pretent that all remaining tests failed, there is nothing else to run,
+        // except for possible retries.
+        remaining = [];
       }
-
-      const remaining = params.remaining;
+      if (params.failedTestId)
+        failedTestIds.add(params.failedTestId);
 
       // Only retry expected failures, not passes and only if the test failed.
-      if (this._config.retries && params.failedTestId) {
-        const pair = this._testById.get(params.failedTestId);
-        if (pair.test.expectedStatus === 'passed' && pair.test.results.length < this._config.retries + 1) {
+      for (const testId of failedTestIds) {
+        const pair = this._testById.get(testId);
+        if (pair.test.expectedStatus === 'passed' && pair.test.results.length < pair.test.retries + 1) {
           pair.result = pair.test._appendTestResult();
           remaining.unshift({
             retry: pair.result.retry,
             testId: pair.test._id,
-            expectedStatus: pair.test.expectedStatus,
-            timeout: pair.test.timeout,
-            skipped: pair.test.skipped,
           });
         }
       }
@@ -231,7 +209,7 @@ export class Dispatcher {
       if (this._freeWorkers.length)
         return Promise.resolve(this._freeWorkers.pop());
       // Create a new worker.
-      if (this._workers.size < this._config.workers)
+      if (this._workers.size < this._loader.config().workers)
         return this._createWorker(entry);
       return null;
     };
@@ -266,6 +244,11 @@ export class Dispatcher {
       result.data = params.data;
       result.duration = params.duration;
       result.error = params.error;
+      test.expectedStatus = params.expectedStatus;
+      test.annotations = params.annotations;
+      test.timeout = params.timeout;
+      if (params.expectedStatus === 'skipped')
+        test.skipped = true;
       this._reportTestEnd(test, result, params.status);
     });
     worker.on('stdOut', (params: TestOutputPayload) => {
@@ -298,12 +281,12 @@ export class Dispatcher {
 
   async stop() {
     this._isStopped = true;
-    if (!this._workers.size)
-      return;
-    const result = new Promise<void>(f => this._stopCallback = f);
-    for (const worker of this._workers)
-      worker.stop();
-    await result;
+    if (this._workers.size) {
+      const result = new Promise<void>(f => this._stopCallback = f);
+      for (const worker of this._workers)
+        worker.stop();
+      await result;
+    }
   }
 
   private _reportTestEnd(test: Test, result: TestResult, status: TestStatus) {
@@ -312,9 +295,10 @@ export class Dispatcher {
     result.status = status;
     if (result.status !== 'skipped' && result.status !== test.expectedStatus)
       ++this._failureCount;
-    if (!this._config.maxFailures || this._failureCount <= this._config.maxFailures)
+    const maxFailures = this._loader.config().maxFailures;
+    if (!maxFailures || this._failureCount <= maxFailures)
       this._reporter.onTestEnd(test, result);
-    if (this._config.maxFailures && this._failureCount === this._config.maxFailures)
+    if (maxFailures && this._failureCount === maxFailures)
       this._isStopped = true;
   }
 
@@ -343,6 +327,7 @@ class Worker extends EventEmitter {
       env: {
         FORCE_COLOR: process.stdout.isTTY ? '1' : '0',
         DEBUG_COLORS: process.stdout.isTTY ? '1' : '0',
+        FOLIO_WORKER_INDEX: String(this.index),
         ...process.env
       },
       // Can't pipe since piping slows down termination for some reason.
@@ -360,10 +345,9 @@ class Worker extends EventEmitter {
     this.hash = entry.hash;
     const params: WorkerInitParams = {
       workerIndex: this.index,
-      fixtureFiles: this.runner._fixtureFiles,
-      variation: entry.variation,
       repeatEachIndex: entry.repeatEachIndex,
-      config: this.runner._config,
+      runListIndex: entry.runListIndex,
+      loader: this.runner._loader.serialize(),
     };
     this.process.send({ method: 'init', params });
     await new Promise(f => this.process.once('message', f));  // Ready ack

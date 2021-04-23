@@ -15,13 +15,22 @@
  * limitations under the License.
  */
 
-import type { TestSuiteFunction } from './types';
-import { createTestImpl } from './spec';
+import type { TestType } from './types';
+import { newTestTypeImpl } from './spec';
+import DotReporter from './reporters/dot';
+import JSONReporter from './reporters/json';
+import JUnitReporter from './reporters/junit';
+import LineReporter from './reporters/line';
+import ListReporter from './reporters/list';
 
 export * from './types';
-export { config } from './fixtures';
 export { expect } from './expect';
-
-export function createTest(options: folio.SuiteOptions): TestSuiteFunction {
-  return createTestImpl(options);
-}
+export { setConfig, setReporters, globalSetup, globalTeardown } from './spec';
+export const test: TestType<{}, {}, {}, {}> = newTestTypeImpl([], undefined);
+export const reporters = {
+  dot: DotReporter,
+  json: JSONReporter,
+  junit: JUnitReporter,
+  line: LineReporter,
+  list: ListReporter,
+};

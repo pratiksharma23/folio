@@ -17,97 +17,174 @@
 import fs from 'fs';
 import path from 'path';
 import { EventEmitter } from 'events';
-import { monotonicTime, raceAgainstDeadline, serializeError } from './util';
-import { TestBeginPayload, TestEndPayload, RunPayload, TestEntry, DonePayload } from './ipc';
-import { debugLog } from './debug';
-import { config, setCurrentTestInfo, currentWorkerIndex } from './fixtures';
-import { FixtureLoader } from './fixtureLoader';
-import { RootSuite, Spec, Suite, Test } from './test';
-import { installTransform } from './transform';
-import { clearCurrentFile, setCurrentFile } from './spec';
-import { TestInfo } from './types';
-
-export const fixtureLoader = new FixtureLoader();
+import { interpretCondition, mergeObjects, monotonicTime, DeadlineRunner, raceAgainstDeadline, serializeError } from './util';
+import { TestBeginPayload, TestEndPayload, RunPayload, TestEntry, DonePayload, WorkerInitParams } from './ipc';
+import { setCurrentTestInfo } from './globals';
+import { Loader } from './loader';
+import { Spec, Suite, Test, TestVariation } from './test';
+import { Env, FullConfig, TestInfo, WorkerInfo } from './types';
+import { RunListDescription } from './spec';
 
 export class WorkerRunner extends EventEmitter {
+  private _params: WorkerInitParams;
+  private _loader: Loader;
+  private _runList: RunListDescription;
+  private _envRunner: EnvRunner;
+  private _outputPathSegment: string;
+  private _workerInfo: WorkerInfo;
+  private _envInitialized = false;
+  private _workerArgs: any;
+
   private _failedTestId: string | undefined;
   private _fatalError: any | undefined;
   private _entries: Map<string, TestEntry>;
   private _remaining: Map<string, TestEntry>;
   private _isStopped: any;
-  private _variation: folio.SuiteVariation;
-  _testId: string | null;
-  private _testInfo: TestInfo | null = null;
-  private _rootSuite: Suite;
-  private _loaded = false;
-  private _repeatEachIndex: number;
+  _currentTest: { testId: string, testInfo: TestInfo } | null = null;
+  private _file: string;
+  private _config: FullConfig;
 
-  constructor(variation: folio.SuiteVariation, repeatEachIndex: number, runPayload: RunPayload) {
+  constructor(params: WorkerInitParams) {
     super();
-    this._rootSuite = new Suite('');
-    this._rootSuite.file = runPayload.file;
-    this._repeatEachIndex = repeatEachIndex;
-    this._entries = new Map(runPayload.entries.map(e => [ e.testId, e ]));
-    this._remaining = new Map(runPayload.entries.map(e => [ e.testId, e ]));
-    this._variation = variation;
-  }
-
-  loadFixtureFiles(files: string[]) {
-    for (const file of files)
-      fixtureLoader.loadFixtureFile(file);
+    this._params = params;
   }
 
   stop() {
     this._isStopped = true;
-    this._testId = null;
-    this._setCurrentTestInfo(null);
+    this._setCurrentTest(null);
+    if (this._envRunner)
+      this._envRunner.stop();
+  }
+
+  async cleanup() {
+    if (!this._envInitialized)
+      return;
+    this._envInitialized = false;
+    // TODO: separate timeout for afterAll?
+    const result = await raceAgainstDeadline(this._envRunner.runAfterAll(this._workerInfo, this._runList.options), this._deadline());
+    if (result.timedOut)
+      throw new Error(`Timeout of ${this._config.timeout}ms exceeded while shutting down environment`);
   }
 
   unhandledError(error: Error | any) {
     if (this._isStopped)
       return;
-    if (this._testInfo) {
-      this._testInfo.status = 'failed';
-      this._testInfo.error = serializeError(error);
-      this._failedTestId = this._testId;
-      this.emit('testEnd', buildTestEndPayload(this._testId, this._testInfo));
-    } else if (!this._loaded) {
+    if (this._currentTest) {
+      this._currentTest.testInfo.status = 'failed';
+      this._currentTest.testInfo.error = serializeError(error);
+      this._failedTestId = this._currentTest.testId;
+      this.emit('testEnd', buildTestEndPayload(this._currentTest.testId, this._currentTest.testInfo));
+    } else {
       // No current test - fatal error.
       this._fatalError = serializeError(error);
     }
     this._reportDoneAndStop();
   }
 
-  async run() {
-    const suites: RootSuite[] = [];
-    const revertBabelRequire = installTransform();
-    setCurrentFile(this._rootSuite.file, suites, fixtureLoader.fixturePool);
-    require(this._rootSuite.file);
-    clearCurrentFile();
-    revertBabelRequire();
-    for (const suite of suites) {
-      for (const fn of fixtureLoader.configureFunctions)
-        fn(suite);
-      suite._renumber();
-      suite.findSpec(spec => {
-        spec._appendTest(this._variation, this._repeatEachIndex);
-      });
-      this._rootSuite._addSuite(suite);
-    }
-    this._loaded = true;
+  private _deadline() {
+    return this._config.timeout ? monotonicTime() + this._config.timeout : undefined;
+  }
 
-    await this._runSuite(this._rootSuite);
-    this._reportDoneAndStop();
+  private _loadIfNeeded() {
+    if (this._loader)
+      return;
+
+    this._loader = new Loader();
+    this._loader.deserialize(this._params.loader);
+    this._runList = this._loader.runLists()[this._params.runListIndex];
+
+    const tags = this._runList.tags.join('-');
+    const sameTagsAndTestType = this._loader.runLists().filter(runList => runList.tags.join('-') === tags && runList.testType === this._runList.testType);
+    if (sameTagsAndTestType.length > 1)
+      this._outputPathSegment = tags + (sameTagsAndTestType.indexOf(this._runList) + 1);
+    else
+      this._outputPathSegment = tags;
+    if (this._outputPathSegment)
+      this._outputPathSegment = '-' + this._outputPathSegment;
+
+    this._config = this._loader.config(this._runList);
+    this._workerInfo = {
+      workerIndex: this._params.workerIndex,
+      config: { ...this._config },
+    };
+  }
+
+  private async _initEnvIfNeeded(envs: Env<any>[]) {
+    envs = [this._runList.env, ...envs];
+
+    if (this._envRunner) {
+      // We rely on the fact that worker only receives tests where
+      // environments with beforeAll/afterAll are the prefix of env list.
+      this._envRunner.update(envs);
+      return;
+    }
+
+    this._envRunner = new EnvRunner(envs);
+    // TODO: separate timeout for beforeAll?
+    const result = await raceAgainstDeadline(this._envRunner.runBeforeAll(this._workerInfo, this._runList.options), this._deadline());
+    this._workerArgs = result.result;
+    if (result.timedOut) {
+      this._fatalError = serializeError(new Error(`Timeout of ${this._config.timeout}ms exceeded while initializing environment`));
+      this._reportDoneAndStop();
+    }
+    this._envInitialized = true;
+  }
+
+  async run(runPayload: RunPayload) {
+    this._file = runPayload.file;
+    this._entries = new Map(runPayload.entries.map(e => [ e.testId, e ]));
+    this._remaining = new Map(runPayload.entries.map(e => [ e.testId, e ]));
+
+    this._loadIfNeeded();
+    this._loader.loadTestFile(this._file);
+
+    const descriptions = this._loader.descriptionsForRunList(this._runList);
+    for (const description of descriptions) {
+      const fileSuite = description.fileSuites.get(this._file);
+      if (!fileSuite)
+        continue;
+      let hasEntries = false;
+      fileSuite.findSpec(spec => {
+        const testVariation: TestVariation = {
+          tags: this._runList.tags,
+          retries: this._config.retries,
+          outputDir: this._config.outputDir,
+          repeatEachIndex: this._params.repeatEachIndex,
+          runListIndex: this._runList.index,
+          workerHash: `does-not-matter`,
+          variationId: `#run-${this._runList.index}#repeat-${this._params.repeatEachIndex}`,
+        };
+        const test = spec._appendTest(testVariation);
+        hasEntries = hasEntries || this._entries.has(test._id);
+      });
+      if (!hasEntries)
+        continue;
+      await this._initEnvIfNeeded(description.envs);
+      await this._runSuite(fileSuite);
+      if (this._isStopped)
+        return;
+    }
+
+    if (this._isStopped)
+      return;
+    this._reportDone();
   }
 
   private async _runSuite(suite: Suite) {
     if (this._isStopped)
       return;
-    try {
-      await this._runHooks(suite, 'beforeAll', 'before');
-    } catch (e) {
-      this._fatalError = serializeError(e);
-      this._reportDoneAndStop();
+    const skipHooks = !this._hasTestsToRun(suite);
+    for (const hook of suite._hooks) {
+      if (hook.type !== 'beforeAll' || skipHooks)
+        continue;
+      if (this._isStopped)
+        return;
+      // TODO: separate timeout for beforeAll?
+      const result = await raceAgainstDeadline(wrapInPromise(hook.fn(this._workerArgs, this._workerInfo)), this._deadline());
+      if (result.timedOut) {
+        this._fatalError = serializeError(new Error(`Timeout of ${this._config.timeout}ms exceeded while running beforeAll hook`));
+        this._reportDoneAndStop();
+      }
     }
     for (const entry of suite._entries) {
       if (entry instanceof Suite)
@@ -115,11 +192,17 @@ export class WorkerRunner extends EventEmitter {
       else
         await this._runSpec(entry);
     }
-    try {
-      await this._runHooks(suite, 'afterAll', 'after');
-    } catch (e) {
-      this._fatalError = serializeError(e);
-      this._reportDoneAndStop();
+    for (const hook of suite._hooks) {
+      if (hook.type !== 'afterAll' || skipHooks)
+        continue;
+      if (this._isStopped)
+        return;
+      // TODO: separate timeout for afterAll?
+      const result = await raceAgainstDeadline(wrapInPromise(hook.fn(this._workerArgs, this._workerInfo)), this._deadline());
+      if (result.timedOut) {
+        this._fatalError = serializeError(new Error(`Timeout of ${this._config.timeout}ms exceeded while running afterAll hook`));
+        this._reportDoneAndStop();
+      }
     }
   }
 
@@ -127,174 +210,243 @@ export class WorkerRunner extends EventEmitter {
     if (this._isStopped)
       return;
     const test = spec.tests[0];
-    if (!this._entries.has(test._id))
+    const entry = this._entries.get(test._id);
+    if (!entry)
       return;
-    const { timeout, expectedStatus, skipped, retry } = this._entries.get(test._id);
-    const deadline = timeout ? monotonicTime() + timeout : 0;
     this._remaining.delete(test._id);
 
-    const testId = test._id;
-    this._testId = testId;
+    const startTime = monotonicTime();
+    let deadlineRunner: DeadlineRunner<any> | undefined;
 
-    this._setCurrentTestInfo({
+    const config = this._workerInfo.config;
+    const relativePath = path.relative(config.testDir, spec.file.replace(/\.(spec|test)\.(js|ts)/, ''));
+    const sanitizedTitle = spec.title.replace(/[^\w\d]+/g, '-');
+    const relativeTestPath = path.join(relativePath, sanitizedTitle);
+    const testId = test._id;
+    const baseOutputDir = (() => {
+      let suffix = this._outputPathSegment;
+      if (entry.retry)
+        suffix += '-retry' + entry.retry;
+      if (this._params.repeatEachIndex)
+        suffix += '-repeat' + this._params.repeatEachIndex;
+      return path.join(config.outputDir, relativeTestPath + suffix);
+    })();
+    const testInfo: TestInfo = {
+      ...this._workerInfo,
       title: spec.title,
       file: spec.file,
       line: spec.line,
       column: spec.column,
       fn: spec.fn,
-      options: spec._options(),
-      variation: this._variation,
-      repeatEachIndex: this._repeatEachIndex,
-      workerIndex: currentWorkerIndex(),
-      retry,
-      expectedStatus,
+      repeatEachIndex: this._params.repeatEachIndex,
+      retry: entry.retry,
+      expectedStatus: 'passed',
+      annotations: [],
       duration: 0,
       status: 'passed',
       stdout: [],
       stderr: [],
-      timeout,
+      timeout: this._config.timeout,
       data: {},
-      relativeArtifactsPath: '',
-      outputPath: () => '',
-      snapshotPath: () => ''
-    });
+      snapshotPathSegment: '',
+      outputDir: baseOutputDir,
+      outputPath: (...pathSegments: string[]): string => {
+        fs.mkdirSync(baseOutputDir, { recursive: true });
+        return path.join(baseOutputDir, ...pathSegments);
+      },
+      snapshotPath: (...pathSegments: string[]): string => {
+        const basePath = path.join(config.testDir, config.snapshotDir, relativeTestPath, testInfo.snapshotPathSegment);
+        return path.join(basePath, ...pathSegments);
+      },
+      skip: (arg?: boolean | string, description?: string) => modifier(testInfo, 'skip', arg, description),
+      fixme: (arg?: boolean | string, description?: string) => modifier(testInfo, 'fixme', arg, description),
+      fail: (arg?: boolean | string, description?: string) => modifier(testInfo, 'fail', arg, description),
+      slow: (arg?: boolean | string, description?: string) => modifier(testInfo, 'slow', arg, description),
+      setTimeout: (timeout: number) => {
+        testInfo.timeout = timeout;
+        if (deadlineRunner)
+          deadlineRunner.setDeadline(deadline());
+      },
+    };
+    this._setCurrentTest({ testInfo, testId });
+    const deadline = () => {
+      return testInfo.timeout ? startTime + testInfo.timeout : undefined;
+    };
 
-    this.emit('testBegin', buildTestBeginPayload(testId, this._testInfo));
+    // Preprocess suite annotations.
+    for (let parent = spec.parent; parent; parent = parent.parent)
+      testInfo.annotations.push(...parent._annotations);
+    if (testInfo.annotations.some(a => a.type === 'skip' || a.type === 'fixme'))
+      testInfo.expectedStatus = 'skipped';
+    else if (testInfo.annotations.some(a => a.type === 'fail'))
+      testInfo.expectedStatus = 'failed';
+    if (testInfo.annotations.some(a => a.type === 'slow'))
+      testInfo.setTimeout(testInfo.timeout * 3);
 
-    if (skipped) {
-      // TODO: don't even send those to the worker.
-      this._testInfo.status = 'skipped';
-      this.emit('testEnd', buildTestEndPayload(testId, this._testInfo));
+    this.emit('testBegin', buildTestBeginPayload(testId, testInfo));
+
+    if (testInfo.expectedStatus === 'skipped') {
+      testInfo.status = 'skipped';
+      this.emit('testEnd', buildTestEndPayload(testId, testInfo));
       return;
     }
 
-    const startTime = monotonicTime();
+    const parents: Suite[] = [];
+    for (let suite = spec.parent; suite; suite = suite.parent)
+      parents.push(suite);
+    const testOptions = parents.reverse().reduce((options, suite) => {
+      return mergeObjects(options, suite._testOptions);
+    }, {});
 
-    let result = await raceAgainstDeadline(this._runTestWithFixturesAndHooks(test, this._testInfo), deadline);
-    // Do not overwrite test failure upon timeout in fixture or hook.
-    if (result.timedOut && this._testInfo.status === 'passed')
-      this._testInfo.status = 'timedOut';
-
-    if (!result.timedOut) {
-      result = await raceAgainstDeadline(this._tearDownTestScope(this._testInfo), deadline);
-      // Do not overwrite test failure upon timeout in fixture or hook.
-      if (result.timedOut && this._testInfo.status === 'passed')
-        this._testInfo.status = 'timedOut';
-    } else {
-      // A timed-out test gets a full additional timeout to teardown test fixture scope.
-      const newDeadline = timeout ? monotonicTime() + timeout : 0;
-      await raceAgainstDeadline(this._tearDownTestScope(this._testInfo), newDeadline);
-    }
-
-    // Async hop above, we could have stopped.
-    if (!this._testInfo)
+    deadlineRunner = new DeadlineRunner(this._runEnvBeforeEach(testInfo, testOptions), deadline());
+    const testArgsResult = await deadlineRunner.result;
+    if (testArgsResult.timedOut && testInfo.status === 'passed')
+      testInfo.status = 'timedOut';
+    if (this._isStopped)
       return;
 
-    this._testInfo.duration = monotonicTime() - startTime;
-    this.emit('testEnd', buildTestEndPayload(testId, this._testInfo));
-    if (this._testInfo.status !== 'passed') {
-      this._failedTestId = this._testId;
+    const testArgs = testArgsResult.result;
+    // Do not run test/teardown if we failed to initialize.
+    if (testArgs !== undefined) {
+      deadlineRunner = new DeadlineRunner(this._runTestWithBeforeHooks(test, testInfo, testArgs), deadline());
+      const result = await deadlineRunner.result;
+      // Do not overwrite test failure upon hook timeout.
+      if (result.timedOut && testInfo.status === 'passed')
+        testInfo.status = 'timedOut';
+      if (this._isStopped)
+        return;
+
+      if (!result.timedOut) {
+        deadlineRunner = new DeadlineRunner(this._runAfterHooks(test, testInfo, testArgs, testOptions), deadline());
+        deadlineRunner.setDeadline(deadline());
+        const hooksResult = await deadlineRunner.result;
+        // Do not overwrite test failure upon hook timeout.
+        if (hooksResult.timedOut && testInfo.status === 'passed')
+          testInfo.status = 'timedOut';
+      } else {
+        // A timed-out test gets a full additional timeout to run after hooks.
+        const newDeadline = this._deadline();
+        deadlineRunner = new DeadlineRunner(this._runAfterHooks(test, testInfo, testArgs, testOptions), newDeadline);
+        await deadlineRunner.result;
+      }
+    }
+    if (this._isStopped)
+      return;
+
+    testInfo.duration = monotonicTime() - startTime;
+    this.emit('testEnd', buildTestEndPayload(testId, testInfo));
+    if (testInfo.status !== 'passed') {
+      this._failedTestId = testId;
       this._reportDoneAndStop();
     }
-    this._setCurrentTestInfo(null);
-    this._testId = null;
+    this._setCurrentTest(null);
   }
 
-  private _setCurrentTestInfo(testInfo: TestInfo | null) {
-    this._testInfo = testInfo;
-    setCurrentTestInfo(testInfo);
+  private _setCurrentTest(currentTest: { testId: string, testInfo: TestInfo} | null) {
+    this._currentTest = currentTest;
+    setCurrentTestInfo(currentTest ? currentTest.testInfo : null);
   }
 
-  private async _runTestWithFixturesAndHooks(test: Test, testInfo: TestInfo) {
+  // Returns TestArgs or undefined when env.beforeEach has failed.
+  private async _runEnvBeforeEach(testInfo: TestInfo, testOptions: any): Promise<any> {
     try {
-      await this._runHooks(test.spec.parent, 'beforeEach', 'before');
+      return await this._envRunner.runBeforeEach(testInfo, testOptions);
     } catch (error) {
       testInfo.status = 'failed';
       testInfo.error = serializeError(error);
+      // Failed to initialize environment - no need to run any hooks now.
+      return undefined;
+    }
+  }
+
+  private async _runTestWithBeforeHooks(test: Test, testInfo: TestInfo, testArgs: any) {
+    try {
+      await this._runHooks(test.spec.parent, 'beforeEach', testArgs, testInfo);
+    } catch (error) {
+      if (error instanceof SkipError) {
+        testInfo.status = 'skipped';
+      } else {
+        testInfo.status = 'failed';
+        testInfo.error = serializeError(error);
+      }
       // Continue running afterEach hooks even after the failure.
     }
 
-    debugLog(`running test "${test.spec.fullTitle()}"`);
+    // Do not run the test when beforeEach hook fails.
+    if (this._isStopped || testInfo.status === 'failed' || testInfo.status === 'skipped')
+      return;
+
     try {
-      // Do not run the test when beforeEach hook fails.
-      if (!this._isStopped && testInfo.status !== 'failed') {
-        // Resolve artifacts and output paths.
-        const testPathSegment = test.spec._options().testPathSegment || '';
-        testInfo.relativeArtifactsPath = relativeArtifactsPath(testInfo, testPathSegment);
-        testInfo.outputPath = outputPath(testInfo);
-        testInfo.snapshotPath = snapshotPath(testInfo);
-        await fixtureLoader.fixturePool.resolveParametersAndRunHookOrTest(test.spec.fn);
-        testInfo.status = 'passed';
-      }
+      await test.spec.fn(testArgs, testInfo);
+      testInfo.status = 'passed';
     } catch (error) {
-      testInfo.status = 'failed';
-      testInfo.error = serializeError(error);
-      // Continue running afterEach hooks and fixtures teardown even after the failure.
+      if (error instanceof SkipError) {
+        testInfo.status = 'skipped';
+      } else {
+        testInfo.status = 'failed';
+        testInfo.error = serializeError(error);
+      }
     }
-    debugLog(`done running test "${test.spec.fullTitle()}"`);
+  }
+
+  private async _runAfterHooks(test: Test, testInfo: TestInfo, testArgs: any, testOptions: any) {
     try {
-      await this._runHooks(test.spec.parent, 'afterEach', 'after');
+      await this._runHooks(test.spec.parent, 'afterEach', testArgs, testInfo);
+    } catch (error) {
+      // Do not overwrite test failure error.
+      if (!(error instanceof SkipError) && testInfo.status === 'passed') {
+        testInfo.status = 'failed';
+        testInfo.error = serializeError(error);
+        // Continue running even after the failure.
+      }
+    }
+    try {
+      await this._envRunner.runAfterEach(testInfo, testOptions);
     } catch (error) {
       // Do not overwrite test failure error.
       if (testInfo.status === 'passed') {
         testInfo.status = 'failed';
         testInfo.error = serializeError(error);
-        // Continue running fixtures teardown even after the failure.
       }
     }
   }
 
-  private async _tearDownTestScope(testInfo: TestInfo) {
-    // Worker will tear down test scope if we are stopped.
+  private async _runHooks(suite: Suite, type: 'beforeEach' | 'afterEach', testArgs: any, testInfo: TestInfo) {
     if (this._isStopped)
-      return;
-    try {
-      await fixtureLoader.fixturePool.teardownScope('test');
-    } catch (error) {
-      // Do not overwrite test failure or hook error.
-      if (testInfo.status === 'passed') {
-        testInfo.status = 'failed';
-        testInfo.error = serializeError(error);
-      }
-    }
-  }
-
-  private async _runHooks(suite: Suite, type: string, dir: 'before' | 'after') {
-    if (this._isStopped)
-      return;
-    debugLog(`running hooks "${type}" for suite "${suite.fullTitle()}"`);
-    if (!this._hasTestsToRun(suite))
       return;
     const all = [];
     for (let s = suite; s; s = s.parent) {
       const funcs = s._hooks.filter(e => e.type === type).map(e => e.fn);
       all.push(...funcs.reverse());
     }
-    if (dir === 'before')
+    if (type === 'beforeEach')
       all.reverse();
     let error: Error | undefined;
     for (const hook of all) {
       try {
-        await fixtureLoader.fixturePool.resolveParametersAndRunHookOrTest(hook);
+        await hook(testArgs, testInfo);
       } catch (e) {
         // Always run all the hooks, and capture the first error.
         error = error || e;
       }
     }
-    debugLog(`done running hooks "${type}" for suite "${suite.fullTitle()}"`);
     if (error)
       throw error;
   }
 
-  private _reportDoneAndStop() {
-    if (this._isStopped)
-      return;
+  private _reportDone() {
     const donePayload: DonePayload = {
       failedTestId: this._failedTestId,
       fatalError: this._fatalError,
       remaining: [...this._remaining.values()],
     };
     this.emit('done', donePayload);
+  }
+
+  private _reportDoneAndStop() {
+    if (this._isStopped)
+      return;
+    this._reportDone();
     this.stop();
   }
 
@@ -303,8 +455,11 @@ export class WorkerRunner extends EventEmitter {
       const entry = this._entries.get(spec.tests[0]._id);
       if (!entry)
         return;
-      const { skipped } = entry;
-      return !skipped;
+      for (let parent = spec.parent; parent; parent = parent.parent) {
+        if (parent._annotations.some(a => a.type === 'skip' || a.type === 'fixme'))
+          return;
+      }
+      return true;
     });
   }
 }
@@ -320,31 +475,121 @@ function buildTestEndPayload(testId: string, testInfo: TestInfo): TestEndPayload
   return {
     testId,
     duration: testInfo.duration,
-    status: testInfo.status,
+    status: testInfo.status!,
     error: testInfo.error,
     data: testInfo.data,
+    expectedStatus: testInfo.expectedStatus,
+    annotations: testInfo.annotations,
+    timeout: testInfo.timeout,
   };
 }
 
-function relativeArtifactsPath(testInfo: TestInfo, parametersPathSegment: string) {
-  const relativePath = path.relative(config.testDir, testInfo.file.replace(/\.(spec|test)\.(js|ts)/, ''));
-  const sanitizedTitle = testInfo.title.replace(/[^\w\d]+/g, '-');
-  return path.join(relativePath, sanitizedTitle, parametersPathSegment);
+function modifier(testInfo: TestInfo, type: 'skip' | 'fail' | 'fixme' | 'slow', arg?: boolean | string, description?: string) {
+  const processed = interpretCondition(arg, description);
+  if (!processed.condition)
+    return;
+  testInfo.annotations.push({ type, description: processed.description });
+  if (type === 'slow') {
+    testInfo.setTimeout(testInfo.timeout * 3);
+  } else if (type === 'skip' || type === 'fixme') {
+    testInfo.expectedStatus = 'skipped';
+    throw new SkipError(processed.description);
+  } else if (type === 'fail') {
+    if (testInfo.expectedStatus !== 'skipped')
+      testInfo.expectedStatus = 'failed';
+  }
 }
 
-function outputPath(testInfo: TestInfo): (...pathSegments: string[]) => string {
-  const retrySuffix = testInfo.retry ? '-retry' + testInfo.retry : '';
-  const repeatEachSuffix = testInfo.repeatEachIndex ? '-repeat' + testInfo.repeatEachIndex : '';
-  const basePath = path.join(config.outputDir, testInfo.relativeArtifactsPath) + retrySuffix + repeatEachSuffix;
-  return (...pathSegments: string[]): string => {
-    fs.mkdirSync(basePath, { recursive: true });
-    return path.join(basePath, ...pathSegments);
-  };
+class SkipError extends Error {
 }
 
-function snapshotPath(testInfo: TestInfo): (...pathSegments: string[]) => string {
-  const basePath = path.join(config.testDir, config.snapshotDir, testInfo.relativeArtifactsPath);
-  return (...pathSegments: string[]): string => {
-    return path.join(basePath, ...pathSegments);
-  };
+async function wrapInPromise(value: any) {
+  return value;
+}
+
+class EnvRunner {
+  private envs: Env[];
+  private workerArgs: any[] = [];
+  private testArgs: any[] = [];
+  private _isStopped = false;
+
+  constructor(envs: Env[]) {
+    this.envs = [...envs];
+  }
+
+  update(envs: Env[]) {
+    this.envs = [...envs];
+  }
+
+  stop() {
+    this._isStopped = true;
+  }
+
+  async runBeforeAll(workerInfo: WorkerInfo, workerOptions: any) {
+    let args = {};
+    for (const env of this.envs) {
+      if (this._isStopped)
+        break;
+      if (env.beforeAll) {
+        const r = await env.beforeAll(mergeObjects(workerOptions, args), workerInfo);
+        args = mergeObjects(args, r);
+      }
+      this.workerArgs.push(args);
+    }
+    return args;
+  }
+
+  async runAfterAll(workerInfo: WorkerInfo, workerOptions: any) {
+    let error: Error | undefined;
+    const count = this.workerArgs.length;
+    for (let index = count - 1; index >= 0; index--) {
+      const args = this.workerArgs.pop();
+      if (this.envs.length <= index)
+        continue;
+      const env = this.envs[index];
+      if (env.afterAll) {
+        try {
+          await env.afterAll(mergeObjects(workerOptions, args), workerInfo);
+        } catch (e) {
+          error = error || e;
+        }
+      }
+    }
+    if (error)
+      throw error;
+  }
+
+  async runBeforeEach(testInfo: TestInfo, testOptions: any) {
+    let args = {};
+    for (const env of this.envs) {
+      if (this._isStopped)
+        break;
+      if (env.beforeEach) {
+        const r = await env.beforeEach(mergeObjects(testOptions, args), testInfo);
+        args = mergeObjects(args, r);
+      }
+      this.testArgs.push(args);
+    }
+    return args;
+  }
+
+  async runAfterEach(testInfo: TestInfo, testOptions: any) {
+    let error: Error | undefined;
+    const count = this.testArgs.length;
+    for (let index = count - 1; index >= 0; index--) {
+      const args = this.testArgs.pop();
+      if (this.envs.length <= index)
+        continue;
+      const env = this.envs[index];
+      if (env.afterEach) {
+        try {
+          await env.afterEach(mergeObjects(testOptions, args), testInfo);
+        } catch (e) {
+          error = error || e;
+        }
+      }
+    }
+    if (error)
+      throw error;
+  }
 }

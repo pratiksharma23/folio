@@ -16,22 +16,30 @@
 
 import fs from 'fs';
 import path from 'path';
-import { Config } from '../types';
-import { EmptyReporter } from '../reporter';
+import { FullConfig } from '../types';
+import EmptyReporter from './empty';
 import { Suite, Test } from '../test';
 import { monotonicTime } from '../util';
 import { formatFailure, stripAscii } from './base';
 
 class JUnitReporter extends EmptyReporter {
-  private config: Config;
+  private config: FullConfig;
   private suite: Suite;
   private timestamp: number;
   private startTime: number;
   private totalTests = 0;
   private totalFailures = 0;
   private totalSkipped = 0;
+  private outputFile: string | undefined;
+  private stripANSIControlSequences = false;
 
-  onBegin(config: Config, suite: Suite) {
+  constructor(options: { outputFile?: string, stripANSIControlSequences?: boolean } = {}) {
+    super();
+    this.outputFile = options.outputFile;
+    this.stripANSIControlSequences = options.stripANSIControlSequences || false;
+  }
+
+  onBegin(config: FullConfig, suite: Suite) {
     this.config = config;
     this.suite = suite;
     this.timestamp = Date.now();
@@ -60,12 +68,12 @@ class JUnitReporter extends EmptyReporter {
       children
     };
 
-    serializeXML(root, tokens);
+    serializeXML(root, tokens, this.stripANSIControlSequences);
     const reportString = tokens.join('\n');
-    const outputName = process.env[`FOLIO_JUNIT_OUTPUT_NAME`];
-    if (outputName) {
-      fs.mkdirSync(path.dirname(outputName), { recursive: true });
-      fs.writeFileSync(outputName, reportString);
+    const outputFile = this.outputFile || process.env[`FOLIO_JUNIT_OUTPUT_NAME`];
+    if (outputFile) {
+      fs.mkdirSync(path.dirname(outputFile), { recursive: true });
+      fs.writeFileSync(outputFile, reportString);
     } else {
       console.log(reportString);
     }
@@ -162,23 +170,30 @@ type XMLEntry = {
   text?: string;
 };
 
-function serializeXML(entry: XMLEntry, tokens: string[]) {
+function serializeXML(entry: XMLEntry, tokens: string[], stripANSIControlSequences: boolean) {
   const attrs: string[] = [];
   for (const name of Object.keys(entry.attributes || {}))
-    attrs.push(`${name}="${escape(String(entry.attributes[name]))}"`);
+    attrs.push(`${name}="${escape(String(entry.attributes[name]), stripANSIControlSequences, false)}"`);
   tokens.push(`<${entry.name}${attrs.length ? ' ' : ''}${attrs.join(' ')}>`);
   for (const child of entry.children || [])
-    serializeXML(child, tokens);
+    serializeXML(child, tokens, stripANSIControlSequences);
   if (entry.text)
-    tokens.push(escape(entry.text));
+    tokens.push(escape(entry.text, stripANSIControlSequences, true));
   tokens.push(`</${entry.name}>`);
 }
 
-function escape(text: string): string {
-  text = text.replace(/"/g, '&quot;');
-  text = text.replace(/&/g, '&amp;');
-  text = text.replace(/</g, '&lt;');
-  text = text.replace(/>/g, '&gt;');
+// See https://en.wikipedia.org/wiki/Valid_characters_in_XML
+const discouragedXMLCharacters = /[\u0001-\u0008\u000b-\u000c\u000e-\u001f\u007f-\u0084\u0086-\u009f]/g;
+const ansiControlSequence = new RegExp('[\\u001B\\u009B][[\\]()#;?]*(?:(?:(?:[a-zA-Z\\d]*(?:;[-a-zA-Z\\d\\/#&.:=?%@~_]*)*)?\\u0007)|(?:(?:\\d{1,4}(?:;\\d{0,4})*)?[\\dA-PR-TZcf-ntqry=><~]))', 'g');
+
+function escape(text: string, stripANSIControlSequences: boolean, isCharacterData: boolean): string {
+  if (stripANSIControlSequences)
+    text = text.replace(ansiControlSequence, '');
+  const escapeRe = isCharacterData ? /[&<]/g : /[&"<>]/g;
+  text = text.replace(escapeRe, c => ({ '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' }[c]));
+  if (isCharacterData)
+    text = text.replace(/]]>/g, ']]&gt;');
+  text = text.replace(discouragedXMLCharacters, '');
   return text;
 }
 

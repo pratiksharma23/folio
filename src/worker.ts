@@ -16,11 +16,9 @@
 
 import { Console } from 'console';
 import * as util from 'util';
-import { debugLog, setDebugWorkerIndex } from './debug';
-import { assignConfig, setCurrentWorkerIndex } from './fixtures';
 import { RunPayload, TestOutputPayload, WorkerInitParams } from './ipc';
 import { serializeError } from './util';
-import { fixtureLoader, WorkerRunner } from './workerRunner';
+import { WorkerRunner } from './workerRunner';
 
 let closed = false;
 
@@ -34,7 +32,7 @@ global.console = new Console({
 
 process.stdout.write = chunk => {
   const outPayload: TestOutputPayload = {
-    testId: testRunner ? testRunner._testId : undefined,
+    testId: workerRunner?._currentTest?.testId,
     ...chunkToParams(chunk)
   };
   sendMessageToParent('stdOut', outPayload);
@@ -44,7 +42,7 @@ process.stdout.write = chunk => {
 if (!process.env.PW_RUNNER_DEBUG) {
   process.stderr.write = chunk => {
     const outPayload: TestOutputPayload = {
-      testId: testRunner ? testRunner._testId : undefined,
+      testId: workerRunner?._currentTest?.testId,
       ...chunkToParams(chunk)
     };
     sendMessageToParent('stdErr', outPayload);
@@ -56,47 +54,33 @@ process.on('disconnect', gracefullyCloseAndExit);
 process.on('SIGINT',() => {});
 process.on('SIGTERM',() => {});
 
-let testRunner: WorkerRunner;
-let fixturesFilesToLoad: string[] = [];
-let initParams: WorkerInitParams;
+let workerRunner: WorkerRunner;
 
 process.on('unhandledRejection', (reason, promise) => {
-  if (testRunner)
-    testRunner.unhandledError(reason);
+  if (workerRunner)
+    workerRunner.unhandledError(reason);
 });
 
 process.on('uncaughtException', error => {
-  if (testRunner)
-    testRunner.unhandledError(error);
+  if (workerRunner)
+    workerRunner.unhandledError(error);
 });
 
 process.on('message', async message => {
   if (message.method === 'init') {
-    initParams = message.params as WorkerInitParams;
-    setDebugWorkerIndex(initParams.workerIndex);
-    setCurrentWorkerIndex(initParams.workerIndex);
-    assignConfig(initParams.config);
-    // We will load fixtures upon the first "run".
-    fixturesFilesToLoad = initParams.fixtureFiles;
-    debugLog(`init`, initParams);
+    const initParams = message.params as WorkerInitParams;
+    workerRunner = new WorkerRunner(initParams);
+    for (const event of ['testBegin', 'testEnd', 'done'])
+      workerRunner.on(event, sendMessageToParent.bind(null, event));
     return;
   }
   if (message.method === 'stop') {
-    debugLog(`stopping...`);
     await gracefullyCloseAndExit();
-    debugLog(`stopped`);
     return;
   }
   if (message.method === 'run') {
     const runPayload = message.params as RunPayload;
-    debugLog(`run`, runPayload);
-    testRunner = new WorkerRunner(initParams.variation, initParams.repeatEachIndex, runPayload);
-    for (const event of ['testBegin', 'testEnd', 'done'])
-      testRunner.on(event, sendMessageToParent.bind(null, event));
-    testRunner.loadFixtureFiles(fixturesFilesToLoad);
-    fixturesFilesToLoad = [];
-    await testRunner.run();
-    testRunner = null;
+    await workerRunner!.run(runPayload);
   }
 });
 
@@ -106,12 +90,12 @@ async function gracefullyCloseAndExit() {
   closed = true;
   // Force exit after 30 seconds.
   setTimeout(() => process.exit(0), 30000);
-  // Meanwhile, try to gracefully close all browsers.
-  if (testRunner)
-    testRunner.stop();
+  // Meanwhile, try to gracefully shutdown.
   try {
-    await fixtureLoader.fixturePool.teardownScope('test');
-    await fixtureLoader.fixturePool.teardownScope('worker');
+    if (workerRunner) {
+      workerRunner.stop();
+      await workerRunner.cleanup();
+    }
   } catch (e) {
     process.send({ method: 'teardownError', params: { error: serializeError(e) } });
   }
@@ -120,8 +104,6 @@ async function gracefullyCloseAndExit() {
 
 function sendMessageToParent(method, params = {}) {
   try {
-    if (method !== 'ready')
-      debugLog(`send`, { method, params });
     process.send({ method, params });
   } catch (e) {
     // Can throw when closing.

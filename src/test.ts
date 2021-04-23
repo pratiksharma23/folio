@@ -24,8 +24,6 @@ class Base {
   parent?: Suite;
 
   _only = false;
-  _skip = false;
-  _ordinal: number;
 
   constructor(title: string, parent?: Suite) {
     this.title = title;
@@ -43,24 +41,17 @@ class Base {
   fullTitle(): string {
     return this.titlePath().join(' ');
   }
-
-  _options(): folio.SuiteOptions {
-    return this.parent ? this.parent._options() : {} as any;
-  }
-
-  _rootSuite(): RootSuite | null {
-    return this.parent ? this.parent._rootSuite() : null;
-  }
 }
 
 export class Spec extends Base implements types.Spec {
   fn: Function;
   tests: Test[] = [];
-  _modifierFn: types.TestModifierFunction | null;
+  _ordinalInFile: number;
 
-  constructor(title: string, fn: Function, suite: Suite) {
+  constructor(title: string, fn: Function, suite: Suite, ordinalInFile: number) {
     super(title, suite);
     this.fn = fn;
+    this._ordinalInFile = ordinalInFile;
     suite._addSpec(this);
   }
 
@@ -68,14 +59,12 @@ export class Spec extends Base implements types.Spec {
     return !this.tests.find(r => !r.ok());
   }
 
-  _appendTest(variation: folio.SuiteVariation, repeatEachIndex: number) {
-    const rootSuite = this._rootSuite()!;
+  _appendTest(variation: TestVariation) {
     const test = new Test(this);
-    const variationString = serializeVariation(variation) + `#repeat-${repeatEachIndex}#`;
-    test._id = `${rootSuite._ordinal}/${this._ordinal}@${this.file}::[${variationString}]`;
-    test.variation = variation;
-    test._repeatEachIndex = repeatEachIndex;
-    test._workerHash = variationString;
+    test.tags = variation.tags;
+    test.retries = variation.retries;
+    test._variation = variation;
+    test._id = `${this._ordinalInFile}@${this.file}${variation.variationId}`;
     this.tests.push(test);
     return test;
   }
@@ -84,14 +73,23 @@ export class Spec extends Base implements types.Spec {
 export class Suite extends Base implements types.Suite {
   suites: Suite[] = [];
   specs: Spec[] = [];
+  _testOptions: any;
   _entries: (Suite | Spec)[] = [];
-  _modifierFn: types.TestModifierFunction | null;
   _hooks: { type: string, fn: Function } [] = [];
+  _annotations: { type: 'skip' | 'fixme' | 'fail', description?: string }[] = [];
 
   constructor(title: string, parent?: Suite) {
     super(title, parent);
     if (parent)
       parent._addSuite(this);
+  }
+
+  _clear() {
+    this.suites = [];
+    this.specs = [];
+    this._entries = [];
+    this._hooks = [];
+    this._annotations = [];
   }
 
   _addSpec(spec: Spec) {
@@ -157,14 +155,6 @@ export class Suite extends Base implements types.Suite {
     return result;
   }
 
-  _renumber() {
-    // All tests are identified with their ordinals.
-    let ordinal = 0;
-    this.findSpec((test: Spec) => {
-      test._ordinal = ordinal++;
-    });
-  }
-
   _hasOnly(): boolean {
     if (this._only)
       return true;
@@ -179,20 +169,29 @@ export class Suite extends Base implements types.Suite {
   }
 }
 
+export type TestVariation = {
+  tags: string[];
+  retries: number;
+  outputDir: string;
+  repeatEachIndex: number;
+  runListIndex: number;
+  workerHash: string;
+  variationId: string;
+};
+
 export class Test implements types.Test {
   spec: Spec;
-  variation: folio.SuiteVariation;
   results: types.TestResult[] = [];
 
   skipped = false;
-  slow = false;
   expectedStatus: types.TestStatus = 'passed';
   timeout = 0;
-  annotations: any[] = [];
+  annotations: { type: string, description?: string }[] = [];
+  tags: string[] = [];
+  retries = 0;
 
   _id: string;
-  _workerHash: string;
-  _repeatEachIndex: number;
+  _variation: TestVariation;
 
   constructor(spec: Spec) {
     this.spec = spec;
@@ -236,37 +235,4 @@ export class Test implements types.Test {
     this.results.push(result);
     return result;
   }
-}
-
-export class RootSuite extends Suite implements types.RootSuite {
-  options: folio.SuiteOptions = {} as any;
-  variations: folio.SuiteVariation[] = [{}];
-
-  vary<K extends keyof folio.SuiteVariation>(key: K, values: folio.SuiteVariation[K][]): void {
-    const newVariations: folio.SuiteVariation[] = [];
-    for (const v of this.variations) {
-      if (key in v)
-        throw new Error(`Duplicate variation key "${key}"`);
-      for (const value of values)
-        newVariations.push({ ...v, [key]: value });
-    }
-    this.variations = newVariations;
-  }
-
-  _options(): folio.SuiteOptions {
-    return this.options;
-  }
-
-  _rootSuite(): RootSuite {
-    return this;
-  }
-}
-
-function serializeVariation(variation: folio.SuiteVariation): string {
-  const tokens = [];
-  const entries = Object.entries(variation);
-  entries.sort((a, b) => a[0].localeCompare(b[0]));
-  for (const [name, value] of entries)
-    tokens.push(`${name}=${value}`);
-  return tokens.join(', ');
 }
